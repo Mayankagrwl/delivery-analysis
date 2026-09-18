@@ -1,0 +1,83 @@
+name: delivery-analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      as_of:
+        description: Frozen evaluation time UTC (ISO-8601), e.g. 2026-09-18T08:00:00Z
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  delivery-analysis:
+    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    env:
+      SRM_BASE_URL: ${{ vars.SRM_BASE_URL }}
+      SRM_BASIC_USER: ${{ vars.SRM_BASIC_USER }}
+      SRM_BASIC_PASSWORD: ${{ secrets.SRM_BASIC_PASSWORD }}
+      SRM_STATES: ${{ vars.SRM_STATES }}
+      SRM_TIMESTAMP_TZ: ${{ vars.SRM_TIMESTAMP_TZ }}
+      STALE_HOURS: ${{ vars.STALE_HOURS }}
+      STALE_MODE: ${{ vars.STALE_MODE }}
+      GRAFANA_MCP_URL: ${{ vars.GRAFANA_MCP_URL }}
+      GRAFANA_MCP_TOKEN: ${{ secrets.GRAFANA_MCP_TOKEN }}
+      GRAFANA_MCP_TRANSPORT: ${{ vars.GRAFANA_MCP_TRANSPORT }}
+      GRAFANA_LOKI_DATASOURCE_UID: ${{ vars.GRAFANA_LOKI_DATASOURCE_UID }}
+      GRAFANA_DASHBOARD_UID: ${{ vars.GRAFANA_DASHBOARD_UID }}
+      GRAFANA_DASHBOARD_TITLE: ${{ vars.GRAFANA_DASHBOARD_TITLE }}
+      GRAFANA_DASHBOARD_FILTERS: ${{ vars.GRAFANA_DASHBOARD_FILTERS }}
+      LOKI_LINE_LIMIT: ${{ vars.LOKI_LINE_LIMIT }}
+      QUERY_GRAFANA_ON_SRM_ERROR: ${{ vars.QUERY_GRAFANA_ON_SRM_ERROR }}
+      STGPT_API: ${{ secrets.STGPT_API }}
+      API_KEY: ${{ secrets.API_KEY }}
+      STGPT_API_URL: ${{ vars.STGPT_API_URL }}
+      STGPT_CLIENT_APP_NAME: ${{ vars.STGPT_CLIENT_APP_NAME }}
+      CLIENT_APP_NAME: ${{ vars.CLIENT_APP_NAME }}
+      RCA_SSL_VERIFY: ${{ vars.RCA_SSL_VERIFY }}
+      RCA_SSL_CERT_FILE: ${{ vars.RCA_SSL_CERT_FILE }}
+      SSL_CERT_FILE: ${{ vars.SSL_CERT_FILE }}
+      TOKEN_BUDGET: ${{ vars.TOKEN_BUDGET }}
+      STRICT: ${{ vars.STRICT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Collect and analyze
+        env:
+          AS_OF: ${{ inputs.as_of }}
+        run: |
+          if [ -n "$AS_OF" ]; then
+            python -m src.delivery_analysis.cli collect --analyze --as-of "$AS_OF"
+          else
+            python -m src.delivery_analysis.cli collect --analyze
+          fi
+
+      - name: Job Summary
+        if: always()
+        run: |
+          if [ -f rca-srm/summary.md ]; then
+            cat rca-srm/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No rca-srm/summary.md produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload rca-srm
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rca-srm
+          path: rca-srm/
+          if-no-files-found: warn
