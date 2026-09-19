@@ -124,9 +124,14 @@ def _evidence_lines(srm: SrmResult, grafana: Any | None) -> list[str]:
     if grafana.filters:
         lines.append("filters=" + ",".join(f"{k}={v}" for k, v in grafana.filters.items()))
     lines.append("### loki_stats")
-    if grafana.time_range:
+    ranges = list(getattr(grafana, "time_ranges", None) or [])
+    if not ranges and grafana.time_range:
+        ranges = [grafana.time_range]
+    for rng in ranges:
+        label = rng.get("label") or ""
+        prefix = f"{label} " if label else ""
         lines.append(
-            f"time_range {grafana.time_range.get('start')} … {grafana.time_range.get('end')}"
+            f"time_range {prefix}{rng.get('start')} … {rng.get('end')}"
         )
     lines.append(f"lines_kept={grafana.lines_kept} lines_discarded={grafana.lines_discarded}")
     if grafana.logql:

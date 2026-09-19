@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -14,12 +15,14 @@ from src.delivery_analysis.grafana import (
     DEFAULT_DASHBOARD_UID,
     LOGQL_TOOLS,
     WRITE_TOOLS,
+    build_time_packs,
     collect_grafana,
     error_logql,
     stream_selector,
     urn_json_filter,
     urn_line_filter,
 )
+from src.delivery_analysis.report import render_summary_md
 from src.delivery_analysis.mcp_sse import iter_sse_events, unwrap_tool_result
 from src.delivery_analysis.verdict import evaluate_payload
 from tests.test_s1 import SCREENSHOT_AS_OF, SCREENSHOT_PAYLOAD
@@ -189,7 +192,15 @@ class GrafanaCollectTests(unittest.TestCase):
                     self.assertNotIn("update_dashboard", names)
                     self.assertNotIn("create_incident", names)
                     logql_calls = [c for c in fake.calls if c[0] in LOGQL_TOOLS]
-                    self.assertLessEqual(len(logql_calls), 4)
+                    self.assertGreaterEqual(len(logql_calls), 4)
+                    self.assertFalse(
+                        any(
+                            (call.get("error") or "") == "LogQL query budget reached"
+                            for call in json.loads(
+                                (Path(tmp) / "grafana.json").read_text(encoding="utf-8")
+                            )["tools"]
+                        )
+                    )
                     logql = [args.get("logql") for _, args in logql_calls]
                     self.assertTrue(any("strn:distribution:DeliveryRequest" in str(q) for q in logql))
                     self.assertTrue(
@@ -362,7 +373,13 @@ class GrafanaCollectTests(unittest.TestCase):
         self.assertLessEqual(len(grafana.highlights[0]), 500)
         self.assertGreater(grafana.lines_discarded, 0)
         logql_calls = [c for c in fake.calls if c[0] in LOGQL_TOOLS]
-        self.assertLessEqual(len(logql_calls), 4)
+        self.assertGreaterEqual(len(logql_calls), 4)
+        self.assertFalse(
+            any(
+                (call.error or "") == "LogQL query budget reached"
+                for call in grafana.tools
+            )
+        )
         self.assertTrue(all(args.get("limit", 200) <= 200 for name, args in fake.calls if name == "query_loki_logs"))
 
     def test_panel_queries_receive_filters(self) -> None:
@@ -379,6 +396,72 @@ class GrafanaCollectTests(unittest.TestCase):
         panel = [args for name, args in fake.calls if name == "get_dashboard_panel_queries"]
         self.assertEqual(panel[0]["variables"]["env"], "prod")
         self.assertEqual(panel[0]["uid"], DEFAULT_DASHBOARD_UID)
+
+    def test_stall_window_queries_august_2026(self) -> None:
+        as_of = datetime(2026, 9, 19, 12, 18, 28, tzinfo=timezone.utc)
+        fake = FakeMcp(responses=_default_responses())
+        srm = evaluate_payload(SCREENSHOT_PAYLOAD, as_of=as_of)
+        self.assertEqual(srm.verdict, "STALE")
+        updated = {rec.updated_on_utc.date().isoformat() for rec in srm.records if rec.updated_on_utc}
+        self.assertIn("2026-08-26", updated)
+        self.assertIn("2026-08-27", updated)
+        settings = load_settings()
+        settings.grafana_mcp_url = "https://grafana-mcp.example.st.com/sse"
+        grafana = collect_grafana(srm, settings, client=fake)
+        starts = [
+            str(args.get("startRfc3339") or "")
+            for name, args in fake.calls
+            if name in LOGQL_TOOLS
+        ]
+        self.assertTrue(
+            any(item.startswith("2026-08") for item in starts),
+            starts,
+        )
+        self.assertTrue(
+            any(item.startswith("2026-09-18") for item in starts),
+            starts,
+        )
+        labels = {rng.get("label") for rng in grafana.time_ranges}
+        self.assertIn("now-24h", labels)
+        self.assertIn("stall", labels)
+        summary = render_summary_md(srm, grafana=grafana)
+        self.assertIn("Time ranges:", summary)
+        self.assertIn("2026-08-26T13:19:56Z", summary)
+        self.assertIn("2026-08-27T11:30:43Z", summary)
+        self.assertIn("2026-09-18T12:18:28Z", summary)
+        self.assertIn("2026-09-19T12:18:28Z", summary)
+        self.assertFalse(
+            any((call.error or "") == "LogQL query budget reached" for call in grafana.tools)
+        )
+
+    def test_build_time_packs_combined_and_per_urn(self) -> None:
+        as_of = datetime(2026, 9, 19, 12, 18, 28, tzinfo=timezone.utc)
+        srm = evaluate_payload(SCREENSHOT_PAYLOAD, as_of=as_of)
+        packs = build_time_packs(srm)
+        self.assertEqual([p.label for p in packs], ["now-24h", "stall"])
+        self.assertEqual(packs[0].start, "2026-09-18T12:18:28Z")
+        self.assertEqual(packs[0].end, "2026-09-19T12:18:28Z")
+        self.assertEqual(packs[1].start, "2026-08-26T13:19:56Z")
+        self.assertEqual(packs[1].end, "2026-08-27T11:30:43Z")
+
+        wide = [
+            {
+                "state": "SUBMITTED",
+                "_urn": "strn:distribution:DeliveryRequest:1",
+                "_updated": {"on": "8/01/2026 12:00:00 AM"},
+            },
+            {
+                "state": "GRANTED",
+                "_urn": "strn:distribution:DeliveryRequest:2",
+                "_updated": {"on": "8/10/2026 12:00:00 AM"},
+            },
+        ]
+        wide_srm = evaluate_payload(wide, as_of=as_of)
+        wide_packs = build_time_packs(wide_srm)
+        labels = [p.label for p in wide_packs]
+        self.assertEqual(labels[0], "now-24h")
+        self.assertNotIn("stall", labels)
+        self.assertTrue(any(label.startswith("urn:") for label in labels))
 
 
 if __name__ == "__main__":

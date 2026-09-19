@@ -17,6 +17,7 @@ from src.delivery_analysis.config import (
     load_settings,
     resolve_stgpt_api_key,
 )
+from src.delivery_analysis.grafana import GrafanaResult
 from src.delivery_analysis.prompt import build_evidence
 from src.delivery_analysis.report import write_artifacts
 from src.delivery_analysis.stgpt_client import (
@@ -255,6 +256,39 @@ class AnalyzeLoopTests(unittest.TestCase):
         record = analyze_staleness(fresh, None, chat_fn=self._chat([]), cache_dir=None)
         self.assertEqual(record.status, "gated")
         self.assertIn("not STALE", record.notes[0])
+
+    def test_garbage_stgpt_with_loki_and_stale_urns_yields_result(self) -> None:
+        grafana = GrafanaResult(
+            skipped=False,
+            highlights=[
+                "gateway timeout waiting for grant strn:distribution:DeliveryRequest:43",
+                "gateway 502 from grant-service DeliveryRequest:38",
+                "gateway retry exhausted for DeliveryRequest:40",
+            ],
+            lines_kept=3,
+        )
+        garbage = "%%% not json at all %%% STGPT unusable output"
+        fn = self._chat([garbage, garbage, garbage, garbage])
+        record = analyze_staleness(self.srm, grafana, chat_fn=fn, cache_dir=None)
+        self.assertIsNotNone(record.result)
+        self.assertEqual(len(fn.personas), 4)
+        self.assertTrue(record.result.cannot_determine)
+        sources = {cite.source for cite in record.result.citations}
+        self.assertTrue(sources <= {"srm_record", "loki_logs"})
+        self.assertTrue(any(cite.source == "srm_record" for cite in record.result.citations))
+        self.assertIn("strn:distribution:DeliveryRequest:43", record.result.root_cause)
+        with TemporaryDirectory() as tmp:
+            write_artifacts(self.srm, Path(tmp), grafana=grafana, analysis=record)
+            analysis = json.loads((Path(tmp) / "analysis.json").read_text(encoding="utf-8"))
+            summary = (Path(tmp) / "summary.md").read_text(encoding="utf-8")
+            self.assertIn("raw_completion", analysis)
+            self.assertIn("%%% not json", analysis["raw_completion"])
+            self.assertEqual(analysis["persona"], "alfred_for_api")
+            self.assertTrue(analysis["notes"])
+            self.assertIsNotNone(analysis["result"])
+            self.assertIn("### AI raw", summary)
+            self.assertIn("parse notes", summary)
+            self.assertIn("%%% not json", summary)
 
 
 class CollectAnalyzeTests(unittest.TestCase):

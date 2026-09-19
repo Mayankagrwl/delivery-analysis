@@ -76,7 +76,7 @@ jobs:
 
       - name: Upload rca-srm
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: rca-srm
           path: rca-srm/

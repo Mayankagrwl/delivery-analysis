@@ -4,6 +4,9 @@ from pathlib import Path
 from typing import Any
 
 from .models import SrmRecord, SrmResult
+from .redact import redact_text
+
+_RAW_CHARS = 2000
 
 
 def _iso(dt) -> str:
@@ -76,10 +79,17 @@ def _grafana_inventory(grafana: Any | None, verdict: str) -> list[str]:
     ds = grafana.loki_datasource_uid or "(not resolved)"
     ds_name = f" ({grafana.loki_datasource_name})" if grafana.loki_datasource_name else ""
     parts.append(f"- Loki datasource: `{ds}`{ds_name}")
-    if grafana.time_range:
-        parts.append(
-            f"- Time range: {grafana.time_range.get('start')} … {grafana.time_range.get('end')}"
-        )
+    ranges = list(getattr(grafana, "time_ranges", None) or [])
+    if not ranges and grafana.time_range:
+        ranges = [grafana.time_range]
+    if ranges:
+        parts.append("- Time ranges:")
+        for rng in ranges:
+            label = rng.get("label") or ""
+            prefix = f"{label}: " if label else ""
+            parts.append(
+                f"  - {prefix}{rng.get('start')} … {rng.get('end')}"
+            )
     if grafana.urn_is_label is True:
         parts.append("- URN join: Loki label `urn`")
     elif grafana.urn_is_label is False:
@@ -160,7 +170,29 @@ def _ai_section(analysis: Any | None, verdict: str) -> list[str]:
         parts.extend(["", f"- token budget used: {analysis.tokens_used} / {budget}"])
     if analysis.prompt_version:
         parts.append(f"- prompt version: {analysis.prompt_version}")
+    if analysis.status != "ok":
+        parts.extend(_ai_raw_section(analysis))
     parts.append("")
+    return parts
+
+
+def _ai_raw_section(analysis: Any) -> list[str]:
+    parts = ["", "### AI raw", ""]
+    if analysis.persona:
+        parts.append(f"- persona: `{analysis.persona}`")
+    notes = list(getattr(analysis, "notes", None) or [])
+    if notes:
+        parts.append("- parse notes:")
+        for note in notes:
+            parts.append(f"  - {note}")
+    raw = getattr(analysis, "raw_completion", None)
+    if isinstance(raw, str) and raw.strip():
+        redacted, _ = redact_text(raw)
+        parts.append("- raw_completion (truncated):")
+        parts.append("")
+        parts.append("```")
+        parts.append(redacted[:_RAW_CHARS])
+        parts.append("```")
     return parts
 
 

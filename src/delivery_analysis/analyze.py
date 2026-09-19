@@ -21,12 +21,13 @@ from .config import (
 )
 from .models import (
     ALLOWED_CITATION_SOURCES,
+    AnalysisCitation,
     AnalysisRecord,
     AnalysisResult,
     AnalysisStatus,
     SrmResult,
 )
-from .prompt import build_evidence, build_messages
+from .prompt import _record_line, build_evidence, build_messages
 from .redact import redact_text, redact_walk
 from .stgpt_client import (
     ChatResult,
@@ -40,6 +41,7 @@ from .stgpt_client import (
 _LOG = logging.getLogger(__name__)
 _FENCE_BLOCK = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 _PREVIEW_CHARS = 240
+_RAW_CHARS = 2000
 _KEY_ALIASES = {
     "rootCause": "root_cause",
     "root_cause": "root_cause",
@@ -127,7 +129,7 @@ def analyze_staleness(
         caller = chat_fn or _make_chat_fn(
             api_key=api_key, url=url, client_app_name=client_app_name
         )
-        record = _run_personas(evidence, caller, base)
+        record = _run_personas(evidence, caller, base, srm=srm, grafana=grafana)
         redacted = _redact_record(record)
         if redacted.status == "ok":
             _cache_put(cache_dir, key, redacted)
@@ -135,16 +137,31 @@ def analyze_staleness(
     except Exception as exc:  # noqa: BLE001
         _LOG.exception("analyze error")
         note, _ = redact_text(f"{exc.__class__.__name__}")
+        fallback = None
+        if _has_grounding(srm, grafana):
+            try:
+                evidence, _, _ = build_evidence(srm, grafana, cap_tokens=cap)
+            except Exception:  # noqa: BLE001
+                evidence = ""
+            fallback = _fallback_result(srm, grafana, evidence)
         return _redact_record(
-            base.model_copy(update={"status": "unusable", "notes": [note]})
+            base.model_copy(
+                update={"status": "unusable", "notes": [note], "result": fallback}
+            )
         )
 
 
 def write_analysis(record: AnalysisRecord, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     dump = json.loads(record.model_dump_json())
-    dump.pop("raw_completion", None)
     dump.pop("stgpt_responses", None)
+    if record.status == "ok":
+        dump.pop("raw_completion", None)
+    else:
+        raw = dump.get("raw_completion")
+        if isinstance(raw, str):
+            redacted, _ = redact_text(raw)
+            dump["raw_completion"] = redacted[:_RAW_CHARS]
     (out_dir / "analysis.json").write_text(
         json.dumps(dump, indent=2) + "\n", encoding="utf-8"
     )
@@ -168,7 +185,14 @@ def _make_chat_fn(
     return _call
 
 
-def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> AnalysisRecord:
+def _run_personas(
+    evidence: str,
+    chat_fn: ChatFn,
+    base: AnalysisRecord,
+    *,
+    srm: SrmResult,
+    grafana: Any | None,
+) -> AnalysisRecord:
     notes: list[str] = []
     last_id: str | None = None
     last_completion: str | None = None
@@ -178,16 +202,21 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
     saw_http_ok = False
     saw_transport = False
 
-    if not flatten_user_content(build_messages(evidence)):
-        return _record(
-            base,
-            status="unusable",
-            persona=None,
-            result=None,
-            fallback_used=False,
-            response_id=None,
-            notes=["prompt_empty"],
-            raw_completion=None,
+    prompt_text = flatten_user_content(build_messages(evidence))
+    if not prompt_text:
+        if not _has_grounding(srm, grafana):
+            return _record(
+                base,
+                status="unusable",
+                persona=None,
+                result=None,
+                fallback_used=False,
+                response_id=None,
+                notes=["prompt_empty"],
+                raw_completion=None,
+            )
+        notes.append(
+            "prompt looked empty; continuing because SRM/Loki evidence exists"
         )
 
     for index, persona in enumerate(PERSONAS):
@@ -200,7 +229,9 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
         chat = _call_chat(chat_fn, persona, messages, notes)
         if chat is None:
             saw_transport = True
-            if any("prompt_empty" in note for note in notes):
+            if any("prompt_empty" in note for note in notes) and not _has_grounding(
+                srm, grafana
+            ):
                 return _record(
                     base,
                     status="unusable",
@@ -293,15 +324,85 @@ def _run_personas(evidence: str, chat_fn: ChatFn, base: AnalysisRecord) -> Analy
         status = "bridge_error"
     else:
         status = "unusable"
+    result = last_outcome.result if last_outcome else None
+    if result is None and _has_grounding(srm, grafana):
+        result = _fallback_result(srm, grafana, evidence)
+        notes.append("deterministic fallback after personas failed")
     return _record(
         base,
         status=status,
         persona=last_persona,
-        result=last_outcome.result if last_outcome else None,
+        result=result,
         fallback_used=fallback_used,
         response_id=last_id,
         notes=notes or ["analyze failed"],
         raw_completion=last_completion,
+    )
+
+
+def _has_grounding(srm: SrmResult, grafana: Any | None) -> bool:
+    if any(rec.stale for rec in srm.records):
+        return True
+    if grafana is None:
+        return False
+    if getattr(grafana, "lines_kept", 0):
+        return True
+    highlights = getattr(grafana, "highlights", None) or []
+    return bool(highlights)
+
+
+def _fallback_result(
+    srm: SrmResult, grafana: Any | None, evidence: str
+) -> AnalysisResult:
+    stale = [rec for rec in srm.records if rec.stale]
+    bits: list[str] = []
+    citations: list[AnalysisCitation] = []
+    for rec in stale:
+        age = rec.age_hours if rec.age_hours is not None else "n/a"
+        bits.append(
+            f"{rec.urn or '(unknown)'} state={rec.state or ''} "
+            f"updated.on={rec.updated_on or ''} age_hours={age}"
+        )
+        quote = rec.urn or _record_line(rec)
+        if quote and quote in evidence:
+            citations.append(AnalysisCitation(quote=quote, source="srm_record"))
+        else:
+            line = _record_line(rec)
+            if line in evidence:
+                citations.append(AnalysisCitation(quote=line, source="srm_record"))
+    loki_lines = list(getattr(grafana, "highlights", None) or []) if grafana else []
+    for line in loki_lines:
+        if line and line in evidence:
+            citations.append(AnalysisCitation(quote=line, source="loki_logs"))
+    if bits:
+        root = (
+            "STGPT did not return a usable analysis. Stale DeliveryRequest records: "
+            + "; ".join(bits)
+            + "."
+        )
+    else:
+        root = "STGPT did not return a usable analysis."
+    if loki_lines:
+        root += " Loki lines: " + " | ".join(loki_lines[:5]) + "."
+    else:
+        root += " No Loki lines were returned in the queried windows."
+    if loki_lines:
+        suggested = (
+            "Inspect the cited Loki lines for the stall, then replay or unlock the "
+            "stale URNs and verify the grant/submit path around each updated.on."
+        )
+    else:
+        suggested = (
+            "Inspect the stale URNs in SRM; query Loki around each updated.on ±2h "
+            "and the last 24h; replay or unlock stuck SUBMITTED/GRANTED requests "
+            "and check grant/submit workers and downstream dependencies."
+        )
+    return AnalysisResult(
+        root_cause=root,
+        suggested_fix=suggested,
+        confidence="low",
+        citations=citations,
+        cannot_determine=True,
     )
 
 

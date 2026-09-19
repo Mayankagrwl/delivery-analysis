@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import re
 import time
-from datetime import timedelta
-from typing import Any
+from datetime import datetime, timedelta
+from typing import Any, NamedTuple
 
 from pydantic import BaseModel, Field
 
@@ -12,6 +12,7 @@ from .config import (
     DEFAULT_DASHBOARD_UID,
     DEFAULT_LINE_LIMIT,
     DEFAULT_MAX_QUERIES,
+    LOGQL_TEMPLATES_PER_PACK,
 )
 from .mcp_sse import McpClient, McpError, mcp_host
 from .models import SrmResult
@@ -32,6 +33,8 @@ WRITE_TOOLS = {
 LOGQL_TOOLS = {"query_loki_logs", "query_loki_stats", "query_loki_patterns"}
 TOKEN_RE = re.compile(r"(?i)(bearer\s+)\S+")
 URN_ID_RE = re.compile(r"strn:distribution:DeliveryRequest:(\d+)")
+STALL_PAD = timedelta(hours=2)
+MAX_COMBINED_STALL = timedelta(days=7)
 
 
 class ToolCallLog(BaseModel):
@@ -57,6 +60,7 @@ class GrafanaResult(BaseModel):
     loki_datasource_name: str | None = None
     logql: list[str] = Field(default_factory=list)
     time_range: dict[str, str] | None = None
+    time_ranges: list[dict[str, str]] = Field(default_factory=list)
     lines_kept: int = 0
     lines_discarded: int = 0
     redactions: int = 0
@@ -66,6 +70,51 @@ class GrafanaResult(BaseModel):
     highlights: list[str] = Field(default_factory=list)
     urn_is_label: bool | None = None
     filters: dict[str, str] = Field(default_factory=dict)
+
+
+class TimePack(NamedTuple):
+    start: str
+    end: str
+    label: str
+
+
+def _fmt_utc(dt: datetime) -> str:
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_time_packs(result: SrmResult) -> list[TimePack]:
+    """now-24h plus stall window around stale updated_on (UTC)."""
+    as_of = result.as_of.astimezone(UTC)
+    hours = result.stale_hours if result.stale_hours else 24
+    now_start = (as_of - timedelta(hours=hours)).astimezone(UTC)
+    packs = [TimePack(_fmt_utc(now_start), _fmt_utc(as_of), "now-24h")]
+
+    stale_times: list[datetime] = []
+    stale_recs: list[Any] = []
+    for rec in result.records:
+        if rec.stale and rec.updated_on_utc is not None:
+            when = rec.updated_on_utc.astimezone(UTC)
+            stale_times.append(when)
+            stale_recs.append(rec)
+    if not stale_times:
+        return packs
+
+    stall_start = min(stale_times) - STALL_PAD
+    stall_end = max(stale_times) + STALL_PAD
+    if stall_end - stall_start <= MAX_COMBINED_STALL:
+        packs.append(TimePack(_fmt_utc(stall_start), _fmt_utc(stall_end), "stall"))
+        return packs
+
+    for rec in stale_recs:
+        when = rec.updated_on_utc.astimezone(UTC)
+        packs.append(
+            TimePack(
+                _fmt_utc(when - STALL_PAD),
+                _fmt_utc(when + STALL_PAD),
+                f"urn:{rec.urn}",
+            )
+        )
+    return packs
 
 
 def _escape_label(value: str) -> str:
@@ -183,25 +232,37 @@ def _label_values(payload: Any) -> list[str]:
     return _label_names(payload)
 
 
-def _log_lines(payload: Any) -> list[str]:
-    lines: list[str] = []
+def _entry_ts(item: dict[str, Any]) -> str:
+    for key in ("timestamp", "ts", "time"):
+        value = item.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _log_entries(payload: Any) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    if payload is None:
+        return entries
     if isinstance(payload, list):
         for item in payload:
-            lines.extend(_log_lines(item))
-        return lines
+            entries.extend(_log_entries(item))
+        return entries
     if isinstance(payload, str):
-        return [payload]
+        return [("", payload)]
     if not isinstance(payload, dict):
-        return lines
+        return entries
     data = payload.get("data")
     if isinstance(data, list):
         for item in data:
             if isinstance(item, dict):
                 line = item.get("line") or item.get("Line") or item.get("message")
                 if line:
-                    lines.append(str(line))
+                    entries.append((_entry_ts(item), str(line)))
             elif isinstance(item, str):
-                lines.append(item)
+                entries.append(("", item))
+            else:
+                entries.extend(_log_entries(item))
     streams = payload.get("streams")
     if isinstance(streams, list):
         for stream in streams:
@@ -209,12 +270,19 @@ def _log_lines(payload: Any) -> list[str]:
                 continue
             for entry in stream.get("lines") or []:
                 if isinstance(entry, dict) and entry.get("line"):
-                    lines.append(str(entry["line"]))
+                    entries.append((_entry_ts(entry), str(entry["line"])))
                 elif isinstance(entry, str):
-                    lines.append(entry)
-    if not lines and payload.get("line"):
-        lines.append(str(payload["line"]))
-    return lines
+                    entries.append(("", entry))
+            for value in stream.get("values") or []:
+                if isinstance(value, (list, tuple)) and len(value) >= 2:
+                    entries.append((str(value[0]), str(value[1])))
+    if not entries and payload.get("line"):
+        entries.append((_entry_ts(payload), str(payload["line"])))
+    return entries
+
+
+def _log_lines(payload: Any) -> list[str]:
+    return [line for _, line in _log_entries(payload)]
 
 
 def _deeplink_url(payload: Any) -> str | None:
@@ -289,10 +357,10 @@ class _Collector:
         self.timeout = float(getattr(settings, "mcp_tool_timeout", 30.0))
         self.filters = dict(getattr(settings, "grafana_dashboard_filters", {}) or {})
         self.urns = stale_urns(srm)
-        start = (srm.as_of - timedelta(hours=srm.stale_hours)).astimezone(UTC)
-        end = srm.as_of.astimezone(UTC)
-        self.start = start.strftime("%Y-%m-%dT%H:%M:%SZ")
-        self.end = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.packs = build_time_packs(srm)
+        first = self.packs[0]
+        self.start = first.start
+        self.end = first.end
         self.result = GrafanaResult(
             mcp_url_host=mcp_host(getattr(settings, "grafana_mcp_url", "") or ""),
             transport="sse",
@@ -301,10 +369,14 @@ class _Collector:
             dashboard_title=getattr(settings, "grafana_dashboard_title", DEFAULT_DASHBOARD_TITLE)
             or DEFAULT_DASHBOARD_TITLE,
             loki_datasource_uid=getattr(settings, "grafana_loki_datasource_uid", None),
-            time_range={"start": self.start, "end": self.end},
+            time_range={"start": first.start, "end": first.end, "label": first.label},
+            time_ranges=[],
             filters=self.filters,
         )
         self._token = getattr(settings, "grafana_mcp_token", None)
+        self._seen_lines: set[tuple[str, str]] = set()
+        self._range_keys: set[tuple[str, str]] = set()
+        self._kept_lines: list[str] = []
 
     def _allowed(self, name: str) -> bool:
         if name in WRITE_TOOLS or name.startswith(WRITE_TOOL_PREFIXES):
@@ -339,6 +411,10 @@ class _Collector:
                 logql = arguments.get("logql")
                 if isinstance(logql, str):
                     self.result.logql.append(logql)
+                start = arguments.get("startRfc3339")
+                end = arguments.get("endRfc3339")
+                if isinstance(start, str) and isinstance(end, str):
+                    self._record_time_range(start, end)
             rows = _row_count(name, payload)
             self.result.tools.append(
                 ToolCallLog(
@@ -352,6 +428,11 @@ class _Collector:
             return payload
         except Exception as exc:
             duration = (time.perf_counter() - started) * 1000
+            if name in LOGQL_TOOLS:
+                start = arguments.get("startRfc3339")
+                end = arguments.get("endRfc3339")
+                if isinstance(start, str) and isinstance(end, str):
+                    self._record_time_range(start, end)
             message = str(exc)
             redacted, n = redact_text(message, self._token)
             self.result.redactions += n
@@ -367,20 +448,54 @@ class _Collector:
             )
             return None
 
+    def _record_time_range(self, start: str, end: str) -> None:
+        key = (start, end)
+        if key in self._range_keys:
+            return
+        self._range_keys.add(key)
+        label = ""
+        for pack in self.packs:
+            if pack.start == start and pack.end == end:
+                label = pack.label
+                break
+        entry = {"start": start, "end": end}
+        if label:
+            entry["label"] = label
+        self.result.time_ranges.append(entry)
+
+    def _raise_query_budget(self, urn_is_label: bool) -> None:
+        templates = LOGQL_TEMPLATES_PER_PACK
+        if urn_is_label:
+            templates = LOGQL_TEMPLATES_PER_PACK - 1
+        required = templates * len(self.packs)
+        if self.max_queries < required:
+            self.result.notes.append(
+                f"raised Loki query budget {self.max_queries} → {required} "
+                f"({templates} templates × {len(self.packs)} time packs)"
+            )
+            self.max_queries = required
+
     def ingest_lines(self, payload: Any) -> list[str]:
         kept: list[str] = []
-        for line in _log_lines(payload):
+        if payload is None:
+            return kept
+        for ts, line in _log_entries(payload):
             trimmed, discarded = truncate_line(line, self.line_chars)
             redacted, n = redact_text(trimmed, self._token)
             self.result.redactions += n
             if discarded:
                 self.result.lines_discarded += 1
+            key = (ts, redacted)
+            if key in self._seen_lines:
+                self.result.lines_discarded += 1
+                continue
+            self._seen_lines.add(key)
             if len(kept) < self.line_limit:
                 kept.append(redacted)
+                self._kept_lines.append(redacted)
                 self.result.lines_kept += 1
             else:
                 self.result.lines_discarded += 1
-        self.result.highlights.extend(kept[:5])
         return kept
 
     def run(self) -> GrafanaResult:
@@ -431,55 +546,15 @@ class _Collector:
             )
             urn_is_label = any(u in values for u in self.urns) if values else True
         self.result.urn_is_label = urn_is_label
+        self._raise_query_budget(urn_is_label)
 
-        selector = stream_selector(
-            self.filters, urns=self.urns, urn_is_label=urn_is_label
-        )
         stats_selector = stream_selector(
             self.filters, urns=self.urns if urn_is_label else None, urn_is_label=urn_is_label
         )
-        self.call(
-            "query_loki_stats",
-            {**time_args, "logql": stats_selector},
-        )
+        for pack in self.packs:
+            self._query_logql_pack(pack, ds, urn_is_label, stats_selector)
 
-        if urn_is_label:
-            logs_query = stream_selector(
-                self.filters, urns=self.urns, urn_is_label=True
-            )
-        else:
-            logs_query = urn_line_filter(
-                stream_selector(self.filters), self.urns or ["strn:distribution:DeliveryRequest"]
-            )
-        logs = self.call(
-            "query_loki_logs",
-            {**time_args, "logql": logs_query, "limit": self.line_limit},
-        )
-        lines = self.ingest_lines(logs) if logs is not None else []
-
-        if not urn_is_label and self.urns:
-            json_query = urn_json_filter(stream_selector(self.filters), self.urns)
-            json_logs = self.call(
-                "query_loki_logs",
-                {**time_args, "logql": json_query, "limit": self.line_limit},
-            )
-            if json_logs is not None:
-                lines.extend(self.ingest_lines(json_logs))
-
-        error_query = error_logql(stream_selector(self.filters))
-        error_logs = self.call(
-            "query_loki_logs",
-            {**time_args, "logql": error_query, "limit": self.line_limit},
-        )
-        if error_logs is not None:
-            lines.extend(self.ingest_lines(error_logs))
-
-        self.call(
-            "query_loki_patterns",
-            {**time_args, "logql": stats_selector},
-        )
-
-        if not lines:
+        if not self._kept_lines:
             self.call(
                 "check_datasources_health",
                 {"uids": [ds]},
@@ -507,8 +582,64 @@ class _Collector:
                     self.result.dashboard_url = self.result.dashboard_url or link
 
         self.result.latency_ms = round((time.perf_counter() - started) * 1000, 1)
-        self.result.highlights = self.result.highlights[:8]
+        self.result.highlights = self._kept_lines[:8]
+        self.result.lines_kept = len(self._kept_lines)
         return self.result
+
+    def _query_logql_pack(
+        self,
+        pack: TimePack,
+        ds: str,
+        urn_is_label: bool,
+        stats_selector: str,
+    ) -> None:
+        time_args = {
+            "datasourceUid": ds,
+            "startRfc3339": pack.start,
+            "endRfc3339": pack.end,
+        }
+        self.call(
+            "query_loki_stats",
+            {**time_args, "logql": stats_selector},
+        )
+
+        if urn_is_label:
+            logs_query = stream_selector(
+                self.filters, urns=self.urns, urn_is_label=True
+            )
+        else:
+            logs_query = urn_line_filter(
+                stream_selector(self.filters),
+                self.urns or ["strn:distribution:DeliveryRequest"],
+            )
+        logs = self.call(
+            "query_loki_logs",
+            {**time_args, "logql": logs_query, "limit": self.line_limit},
+        )
+        if logs is not None:
+            self.ingest_lines(logs)
+
+        if not urn_is_label and self.urns:
+            json_query = urn_json_filter(stream_selector(self.filters), self.urns)
+            json_logs = self.call(
+                "query_loki_logs",
+                {**time_args, "logql": json_query, "limit": self.line_limit},
+            )
+            if json_logs is not None:
+                self.ingest_lines(json_logs)
+
+        error_query = error_logql(stream_selector(self.filters))
+        error_logs = self.call(
+            "query_loki_logs",
+            {**time_args, "logql": error_query, "limit": self.line_limit},
+        )
+        if error_logs is not None:
+            self.ingest_lines(error_logs)
+
+        self.call(
+            "query_loki_patterns",
+            {**time_args, "logql": stats_selector},
+        )
 
 
 def _public_args(arguments: dict[str, Any]) -> dict[str, Any]:
