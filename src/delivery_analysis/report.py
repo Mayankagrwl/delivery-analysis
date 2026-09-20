@@ -127,7 +127,13 @@ def _grafana_inventory(grafana: Any | None, verdict: str) -> list[str]:
             + ", ".join(f"{k}={v}" for k, v in sorted(counts_comp.items()))
         )
     parts.append(f"- Log lines kept: {grafana.lines_kept}")
-    parts.append(f"- Log lines discarded (limit/truncate): {grafana.lines_discarded}")
+    stale_urn_n = getattr(grafana, "lines_with_stale_urn", None)
+    if stale_urn_n is not None:
+        parts.append(f"- Lines containing a stale URN: {stale_urn_n}")
+    truncated_n = getattr(grafana, "lines_truncated", None)
+    if truncated_n is not None:
+        parts.append(f"- Lines truncated: {truncated_n}")
+    parts.append(f"- Log lines discarded (limit/dedup): {grafana.lines_discarded}")
     parts.append(f"- Redactions: {grafana.redactions}")
     if grafana.deeplinks:
         parts.append("- Deep links:")

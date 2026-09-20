@@ -22,7 +22,8 @@ from .models import SrmResult
 from .timestamps import UTC
 
 DEFAULT_DASHBOARD_FOLDER = "Distribution"
-DEFAULT_LINE_CHARS = 500
+DEFAULT_LINE_CHARS = 8000
+HIGHLIGHT_RADIUS = 200
 WRITE_TOOL_PREFIXES = ("update_", "create_", "delete_")
 WRITE_TOOLS = {
     "alerting_manage_rules",
@@ -39,6 +40,8 @@ LOGQL_TOOLS = {
 }
 TOKEN_RE = re.compile(r"(?i)(bearer\s+)\S+")
 URN_ID_RE = re.compile(r"strn:distribution:DeliveryRequest:(\d+)")
+DELIVERY_URN_RE = re.compile(r"strn:distribution:DeliveryRequest:\d+")
+EVENTSENDER_PAIR_RE = re.compile(r"\b(Started|Sent)\b")
 STALL_PAD_BEFORE = timedelta(hours=2)
 STALL_PAD_AFTER = timedelta(hours=6)
 MAX_COMBINED_STALL = timedelta(days=7)
@@ -103,6 +106,8 @@ class GrafanaResult(BaseModel):
     distribution_lines: list[str] = Field(default_factory=list)
     other_lines: list[str] = Field(default_factory=list)
     level_pass: dict[str, str] = Field(default_factory=dict)
+    lines_with_stale_urn: int = 0
+    lines_truncated: int = 0
 
 
 class TimePack(NamedTuple):
@@ -369,7 +374,11 @@ def rewrite_panel_logql(
         kept: list[str] = []
         for part in parts:
             key = part.split("=", 1)[0].strip().lstrip("~")
-            if key.lower() in {"env", "level", "service"}:
+            if key.lower() in {"level", "service"}:
+                continue
+            if key.lower() == "env":
+                _, _, value = part.partition("=")
+                kept.append("environment=" + value if value else 'environment="production"')
                 continue
             kept.append(part)
         if not kept:
@@ -544,9 +553,82 @@ def redact_text(text: str, extra: str | None = None) -> tuple[str, int]:
 
 
 def truncate_line(line: str, limit: int = DEFAULT_LINE_CHARS) -> tuple[str, bool]:
+    """Persist-cap a Loki line. Prefer a window around the DeliveryRequest URN."""
     if len(line) <= limit:
         return line, False
-    return line[:limit], True
+    span = _urn_span(line)
+    if span is None:
+        return line[:limit], True
+    start, end = span
+    extra = max(0, limit - (end - start))
+    left = extra // 2
+    right = extra - left
+    a = max(0, start - left)
+    b = min(len(line), end + right)
+    if b - a < limit:
+        if a == 0:
+            b = min(len(line), a + limit)
+        else:
+            a = max(0, b - limit)
+    return line[a:b], True
+
+
+def _urn_span(line: str) -> tuple[int, int] | None:
+    match = DELIVERY_URN_RE.search(line)
+    if not match:
+        return None
+    return match.start(), match.end()
+
+
+def highlight_snippet(line: str, *, radius: int = HIGHLIGHT_RADIUS) -> str:
+    """Summary snippet centered on DeliveryRequest URN when present."""
+    span = _urn_span(line)
+    if span is None:
+        cap = radius * 2
+        return line if len(line) <= cap else line[:cap]
+    start, end = span
+    a = max(0, start - radius)
+    b = min(len(line), end + radius)
+    snippet = line[a:b]
+    if a > 0:
+        snippet = "…" + snippet
+    if b < len(line):
+        snippet = snippet + "…"
+    return snippet
+
+
+def _second_bucket(ts: str) -> str:
+    text = (ts or "").strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        n = int(text)
+        if n >= 10**18:
+            n //= 10**9
+        elif n >= 10**15:
+            n //= 10**6
+        elif n >= 10**12:
+            n //= 10**3
+        return str(n)
+    if "T" in text:
+        return text.replace("Z", "")[:19]
+    return text[:19]
+
+
+def eventsender_dedup_key(ts: str, line: str) -> tuple[str, str] | None:
+    if "EventSender" not in line:
+        return None
+    return (_second_bucket(ts), EVENTSENDER_PAIR_RE.sub("*", line))
+
+
+def line_has_stale_urn(line: str, urns: list[str]) -> bool:
+    for urn in urns:
+        if urn and urn in line:
+            return True
+        match = URN_ID_RE.search(urn or "")
+        if match and f"DeliveryRequest:{match.group(1)}" in line:
+            return True
+    return False
 
 
 class _Collector:
@@ -603,6 +685,7 @@ class _Collector:
         )
         self._token = getattr(settings, "grafana_mcp_token", None)
         self._seen_lines: set[tuple[str, str]] = set()
+        self._seen_eventsender: set[tuple[str, str]] = set()
         self._range_keys: set[tuple[str, str]] = set()
         self._kept_lines: list[str] = []
         self._distribution_lines: list[str] = []
@@ -724,11 +807,11 @@ class _Collector:
             return kept
         preferred = self.preferred_component
         for ts, line in _log_entries(payload):
-            trimmed, discarded = truncate_line(line, self.line_chars)
-            redacted, n = redact_text(trimmed, self._token)
+            persisted, truncated = truncate_line(line, self.line_chars)
+            redacted, n = redact_text(persisted, self._token)
             self.result.redactions += n
-            if discarded:
-                self.result.lines_discarded += 1
+            if truncated:
+                self.result.lines_truncated += 1
             level = classify_level(redacted)
             if level == "debug" and level_pass != "debug":
                 self.result.lines_discarded += 1
@@ -741,13 +824,21 @@ class _Collector:
             if key in self._seen_lines:
                 self.result.lines_discarded += 1
                 continue
+            pair_key = eventsender_dedup_key(ts, redacted)
+            if pair_key is not None and pair_key in self._seen_eventsender:
+                self.result.lines_discarded += 1
+                continue
             self._seen_lines.add(key)
+            if pair_key is not None:
+                self._seen_eventsender.add(pair_key)
             if len(kept) >= self.line_limit:
                 self.result.lines_discarded += 1
                 continue
             kept.append(redacted)
             self._kept_lines.append(redacted)
             self.result.lines_kept += 1
+            if line_has_stale_urn(redacted, self.urns):
+                self.result.lines_with_stale_urn += 1
             level_key = level or level_pass
             self.result.level_counts[level_key] = (
                 self.result.level_counts.get(level_key, 0) + 1
@@ -875,7 +966,12 @@ class _Collector:
         self.result.latency_ms = round((time.perf_counter() - started) * 1000, 1)
         self.result.distribution_lines = list(self._distribution_lines)
         self.result.other_lines = list(self._other_lines)
-        self.result.highlights = (self._distribution_lines + self._other_lines)[:8]
+        snippets = [
+            highlight_snippet(line)
+            for line in (self._distribution_lines + self._other_lines)
+        ]
+        snippets.sort(key=lambda text: 0 if "DeliveryRequest:" in text else 1)
+        self.result.highlights = snippets[:8]
         self.result.lines_kept = len(self._kept_lines)
         return self.result
 

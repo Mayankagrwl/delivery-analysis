@@ -19,6 +19,7 @@ from src.delivery_analysis.grafana import (
     build_time_packs,
     collect_grafana,
     error_logql,
+    highlight_snippet,
     stream_selector,
     urn_json_filter,
     urn_line_filter,
@@ -400,6 +401,79 @@ class GrafanaCollectTests(unittest.TestCase):
             )
         )
         self.assertTrue(all(args.get("limit", 200) <= 200 for name, args in fake.calls if name == "query_loki_logs"))
+        summary = render_summary_md(srm, grafana=grafana)
+        self.assertIn("Lines containing a stale URN:", summary)
+        self.assertIn("Lines truncated:", summary)
+
+    def test_highlight_keeps_urn_at_end_of_long_line(self) -> None:
+        prefix = (
+            "LEVEL=INFO EventSender Started DeliveryAction "
+            + ("meta " * 400)
+        )
+        urn = "strn:distribution:DeliveryRequest:43"
+        long_line = prefix + f'"urn":"{urn}"'
+
+        def logs(args: dict) -> dict:
+            query = str(args.get("logql") or "")
+            if "LEVEL=(INFO|info)" not in query:
+                return {"data": []}
+            return {
+                "data": [
+                    {
+                        "line": long_line,
+                        "timestamp": "2026-08-27T09:30:43Z",
+                    }
+                ]
+            }
+
+        responses = _default_responses()
+        responses["query_loki_logs"] = logs
+        fake = FakeMcp(responses=responses)
+        srm = evaluate_payload(SCREENSHOT_PAYLOAD, as_of=SCREENSHOT_AS_OF)
+        settings = load_settings()
+        settings.grafana_mcp_url = "https://grafana-mcp.example.st.com/sse"
+        grafana = collect_grafana(srm, settings, client=fake)
+        self.assertTrue(any("DeliveryRequest:43" in h for h in grafana.highlights))
+        packed = grafana.distribution_lines + grafana.other_lines
+        self.assertTrue(any(urn in line for line in packed))
+        self.assertGreaterEqual(grafana.lines_with_stale_urn, 1)
+        summary = render_summary_md(srm, grafana=grafana)
+        self.assertIn("DeliveryRequest:43", summary)
+        snippet = highlight_snippet(long_line)
+        self.assertIn("DeliveryRequest:43", snippet)
+        self.assertLess(len(snippet), len(long_line))
+
+    def test_eventsender_started_sent_dedup_per_second(self) -> None:
+        ts = "2026-08-27T09:30:43Z"
+        started = (
+            "LEVEL=INFO EventSender Started DeliveryAction "
+            "strn:distribution:DeliveryRequest:43"
+        )
+        sent = (
+            "LEVEL=INFO EventSender Sent DeliveryAction "
+            "strn:distribution:DeliveryRequest:43"
+        )
+
+        def logs(args: dict) -> dict:
+            query = str(args.get("logql") or "")
+            if "LEVEL=(INFO|info)" not in query:
+                return {"data": []}
+            return {
+                "data": [
+                    {"line": started, "timestamp": ts},
+                    {"line": sent, "timestamp": ts},
+                ]
+            }
+
+        responses = _default_responses()
+        responses["query_loki_logs"] = logs
+        fake = FakeMcp(responses=responses)
+        srm = evaluate_payload(SCREENSHOT_PAYLOAD, as_of=SCREENSHOT_AS_OF)
+        settings = load_settings()
+        settings.grafana_mcp_url = "https://grafana-mcp.example.st.com/sse"
+        grafana = collect_grafana(srm, settings, client=fake)
+        packed = grafana.distribution_lines + grafana.other_lines
+        self.assertEqual(sum("EventSender" in line for line in packed), 1)
 
     def test_panel_queries_receive_filters(self) -> None:
         fake = FakeMcp(responses=_default_responses())

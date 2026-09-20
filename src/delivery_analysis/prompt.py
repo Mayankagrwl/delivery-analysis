@@ -173,7 +173,12 @@ def _evidence_lines(srm: SrmResult, grafana: Any | None) -> list[str]:
         lines.append(
             f"time_range {prefix}{rng.get('start')} … {rng.get('end')}"
         )
-    lines.append(f"lines_kept={grafana.lines_kept} lines_discarded={grafana.lines_discarded}")
+    lines.append(
+        f"lines_kept={grafana.lines_kept} "
+        f"lines_with_stale_urn={getattr(grafana, 'lines_with_stale_urn', 0)} "
+        f"lines_truncated={getattr(grafana, 'lines_truncated', 0)} "
+        f"lines_discarded={grafana.lines_discarded}"
+    )
     counts_level = getattr(grafana, "level_counts", None) or {}
     if counts_level:
         lines.append(
