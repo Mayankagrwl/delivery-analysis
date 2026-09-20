@@ -36,25 +36,29 @@ WRITE_TOOLS = {
 LOGQL_TOOLS = {
     "query_loki_logs",
     "query_loki_stats",
-    "query_loki_patterns",
-    "find_error_pattern_logs",
 }
 TOKEN_RE = re.compile(r"(?i)(bearer\s+)\S+")
 URN_ID_RE = re.compile(r"strn:distribution:DeliveryRequest:(\d+)")
 STALL_PAD_BEFORE = timedelta(hours=2)
 STALL_PAD_AFTER = timedelta(hours=6)
 MAX_COMBINED_STALL = timedelta(days=7)
-SEVERITY_PATTERN = "(?i)alert|error|warn|fail|timeout|denied|exception"
-DEBUG_LEVELS = {"debug", "info"}
+LEVEL_WARN_FILTER = "LEVEL=(alert|error|warn|ALERT|ERROR|WARN)"
+LEVEL_INFO_FILTER = "LEVEL=(INFO|info)"
+LEVEL_DEBUG_FILTER = "LEVEL=(debug|DEBUG)"
+SEVERITY_PATTERN = LEVEL_WARN_FILTER
+DEBUG_LEVELS = {"debug"}
 KEEP_LEVELS = {"alert", "error", "warn", "warning", "fatal", "critical"}
 LEVEL_RE = re.compile(
-    r'(?i)(?:level["\']?\s*[:=]\s*["\']?|\[)(alert|error|warn(?:ing)?|debug|info|fatal|critical)\b'
+    r'(?:LEVEL|level)[=:][\s"]*(alert|error|warn(?:ing)?|debug|info|fatal|critical)\b'
+    r'|\[(alert|error|warn(?:ing)?|debug|info)\]',
+    re.IGNORECASE,
 )
 COMPONENT_RE = re.compile(
-    r'(?i)(?:component|service)["\']?\s*[:=]\s*["\']?([A-Za-z0-9_.:-]+)'
+    r'(?i)(?:component)["\']?\s*[:=]\s*["\']?([A-Za-z0-9_.:-]+)'
 )
 SELECTOR_RE = re.compile(r"\{([^}]*)\}")
 PANEL_EXPR_KEYS = {"expr", "logql", "query", "exprraw", "rawsql"}
+VAR_BRACE_RE = re.compile(r"\$\{([^}]+)\}")
 
 
 class ToolCallLog(BaseModel):
@@ -98,6 +102,7 @@ class GrafanaResult(BaseModel):
     component_counts: dict[str, int] = Field(default_factory=dict)
     distribution_lines: list[str] = Field(default_factory=list)
     other_lines: list[str] = Field(default_factory=list)
+    level_pass: dict[str, str] = Field(default_factory=dict)
 
 
 class TimePack(NamedTuple):
@@ -182,38 +187,19 @@ def stream_selector(
     urn_is_label: bool = False,
     component_key: str = "component",
 ) -> str:
+    """Explore-style selector: component only. Never env= or level= inside {}."""
+    del urns, urn_is_label, component_key
     parts: list[str] = []
-    env = filters.get("env")
-    if env:
-        parts.append(_label_pair("env", env))
-    comp = filters.get("component") or filters.get(component_key)
+    comp = filters.get("component")
     if comp:
-        parts.append(_label_pair(component_key, comp))
-    level = filters.get("level")
-    if level:
-        parts.append(_label_pair("level", level))
-    if urn_is_label and urns:
-        if len(urns) == 1:
-            parts.append(f'urn="{_escape_label(urns[0])}"')
-        else:
-            joined = "|".join(_escape_regex(u) for u in urns)
-            parts.append(f'urn=~"{joined}"')
+        parts.append(_label_pair("component", comp))
     if not parts:
-        parts.append(f'{component_key}=~".+"')
+        parts.append('component=~".+"')
     return "{" + ", ".join(parts) + "}"
 
 
-def env_component_selector(env: str, component_key: str, component_value: str) -> str:
-    return (
-        "{"
-        + ", ".join(
-            [
-                _label_pair("env", env),
-                _label_pair(component_key, component_value),
-            ]
-        )
-        + "}"
-    )
+def component_selector(component_value: str) -> str:
+    return "{" + _label_pair("component", component_value) + "}"
 
 
 def urn_line_filter(selector: str, urns: list[str]) -> str:
@@ -242,7 +228,7 @@ def urn_json_filter(selector: str, urns: list[str]) -> str:
 
 
 def error_logql(selector: str) -> str:
-    return f'{selector} |= "DeliveryRequest" |~ "{SEVERITY_PATTERN}"'
+    return f'{selector} |= "DeliveryRequest" |~ "{LEVEL_WARN_FILTER}"'
 
 
 def urn_match_filter(urns: list[str]) -> str:
@@ -257,12 +243,20 @@ def urn_match_filter(urns: list[str]) -> str:
     return f'|~ "strn:distribution:DeliveryRequest:({"|".join(ids)})"'
 
 
-def severity_line_filter() -> str:
-    return f'|~ "{SEVERITY_PATTERN}"'
+def severity_line_filter(level_filter: str = LEVEL_WARN_FILTER) -> str:
+    return f'|~ "{level_filter}"'
+
+
+def level_filter_for_pass(level_pass: str) -> str:
+    if level_pass == "info":
+        return LEVEL_INFO_FILTER
+    if level_pass == "debug":
+        return LEVEL_DEBUG_FILTER
+    return LEVEL_WARN_FILTER
 
 
 def preferred_component_value(filters: dict[str, str]) -> str:
-    raw = (filters.get("component") or filters.get("SERVICE") or DEFAULT_COMPONENT).strip()
+    raw = (filters.get("component") or DEFAULT_COMPONENT).strip()
     if raw.lower() in {"all", "*", ".+"}:
         return ".+"
     if raw.startswith("~"):
@@ -277,20 +271,24 @@ def build_priority_logql(
     component_key: str = "component",
     preferred_component: str = DEFAULT_COMPONENT,
     include_per_urn: bool = True,
+    level_pass: str = "warn",
 ) -> list[str]:
-    """Ordered LogQL: preferred component first, then All. No usernames."""
-    sev = severity_line_filter()
+    """Explore LogQL: {component=...} then URN then LEVEL= line filter. No env/level labels."""
+    del env, component_key
+    sev = severity_line_filter(level_filter_for_pass(level_pass))
     combined = urn_match_filter(urns)
     queries: list[str] = []
     pref = preferred_component or DEFAULT_COMPONENT
     skip_pref = pref in {".+", "all", "All", "*"}
     if not skip_pref:
-        dist = env_component_selector(env, component_key, pref)
+        dist = component_selector(pref)
         queries.append(f"{dist} {combined} {sev}")
         if include_per_urn and len(urns) > 1:
             for urn in urns:
                 queries.append(f'{dist} |= "{_escape_label(urn)}" {sev}')
-    all_sel = env_component_selector(env, component_key, ".+")
+        elif include_per_urn and len(urns) == 1:
+            queries.append(f'{dist} |= "{_escape_label(urns[0])}" {sev}')
+    all_sel = component_selector(".+")
     queries.append(f"{all_sel} {combined} {sev}")
     return queries
 
@@ -299,10 +297,10 @@ def classify_level(line: str) -> str | None:
     match = LEVEL_RE.search(line)
     if not match:
         return None
-    value = match.group(1).lower()
+    value = (match.group(1) or match.group(2) or "").lower()
     if value == "warning":
         return "warn"
-    return value
+    return value or None
 
 
 def classify_component(line: str) -> str | None:
@@ -341,31 +339,51 @@ def _panel_logql(payload: Any) -> list[str]:
     return out
 
 
+def substitute_panel_vars(expr: str, variables: dict[str, str]) -> str:
+    out = expr
+    for key, value in variables.items():
+        out = out.replace("${" + key + "}", value)
+        out = out.replace("$" + key, value)
+        out = out.replace("[[" + key + "]]", value)
+    return out
+
+
 def rewrite_panel_logql(
     expr: str,
     *,
     env: str,
     level: str,
     urns: list[str],
-) -> str:
+    variables: dict[str, str] | None = None,
+    level_pass: str = "warn",
+) -> str | None:
+    del env, level
+    vars_map = dict(variables or {})
+    out = substitute_panel_vars(expr, vars_map)
+    if "${" in out:
+        return None
+
     def repl(match: re.Match[str]) -> str:
         inner = match.group(1)
         parts = [p.strip() for p in inner.split(",") if p.strip()]
         kept: list[str] = []
         for part in parts:
-            key = part.split("=", 1)[0].strip()
-            if key.lower() in {"env", "level"}:
+            key = part.split("=", 1)[0].strip().lstrip("~")
+            if key.lower() in {"env", "level", "service"}:
                 continue
             kept.append(part)
-        injected = [_label_pair("env", env), _label_pair("level", level)] + kept
-        return "{" + ", ".join(injected) + "}"
+        if not kept:
+            kept.append('component=~".+"')
+        return "{" + ", ".join(kept) + "}"
 
-    out = SELECTOR_RE.sub(repl, expr, count=1)
+    out = SELECTOR_RE.sub(repl, out, count=1)
+    if "${" in out:
+        return None
     urn_f = urn_match_filter(urns)
     if urns and "DeliveryRequest" not in out:
         out = f"{out} {urn_f}"
-    sev = severity_line_filter()
-    if SEVERITY_PATTERN not in out and "alert|error|warn" not in out:
+    sev = severity_line_filter(level_filter_for_pass(level_pass))
+    if "LEVEL=" not in out:
         out = f"{out} {sev}"
     return out
 
@@ -554,6 +572,7 @@ class _Collector:
         self.level = (self.filters.get("level") or DEFAULT_LEVELS).strip() or DEFAULT_LEVELS
         self.preferred_component = preferred_component_value(self.filters)
         self.component_key = "component"
+        self.include_debug = bool(getattr(settings, "include_debug_logs", False))
         self.urns = stale_urns(srm)
         self.packs = build_time_packs(srm)
         first = self.packs[0]
@@ -580,6 +599,7 @@ class _Collector:
             component_key=self.component_key,
             component_order=[pref_label, ".+"],
             levels=level_list,
+            level_pass={},
         )
         self._token = getattr(settings, "grafana_mcp_token", None)
         self._seen_lines: set[tuple[str, str]] = set()
@@ -679,10 +699,11 @@ class _Collector:
         n_time = max(1, len(self.packs))
         n_combined = n_time * 2
         n_per_urn = len(self.urns) if len(self.urns) > 1 else 0
-        n_cluster = 3
+        n_passes = 3 if self.include_debug else 2
+        n_cluster = 1
         required = max(
-            LOGQL_TEMPLATES_PER_PACK * n_time,
-            n_combined + n_per_urn + n_cluster + n_panel * n_time,
+            LOGQL_TEMPLATES_PER_PACK * n_time * n_passes,
+            (n_combined + n_per_urn) * n_passes + n_cluster + n_panel * n_time,
         )
         if self.max_queries < required:
             self.result.notes.append(
@@ -696,6 +717,7 @@ class _Collector:
         payload: Any,
         *,
         component_hint: str | None = None,
+        level_pass: str = "warn",
     ) -> list[str]:
         kept: list[str] = []
         if payload is None:
@@ -708,9 +730,12 @@ class _Collector:
             if discarded:
                 self.result.lines_discarded += 1
             level = classify_level(redacted)
-            if level in DEBUG_LEVELS:
+            if level == "debug" and level_pass != "debug":
                 self.result.lines_discarded += 1
                 self._debug_dropped += 1
+                continue
+            if level_pass == "warn" and level == "info":
+                self.result.lines_discarded += 1
                 continue
             key = (ts, redacted)
             if key in self._seen_lines:
@@ -723,7 +748,7 @@ class _Collector:
             kept.append(redacted)
             self._kept_lines.append(redacted)
             self.result.lines_kept += 1
-            level_key = level or "unknown"
+            level_key = level or level_pass
             self.result.level_counts[level_key] = (
                 self.result.level_counts.get(level_key, 0) + 1
             )
@@ -783,11 +808,8 @@ class _Collector:
         names_payload = self.call("list_loki_label_names", dict(time_args))
         raw_names = _label_names(names_payload)
         lower_map = {n.lower(): n for n in raw_names}
-        if "component" in lower_map:
-            self.component_key = lower_map["component"]
-        elif "service" in lower_map:
-            self.component_key = lower_map["service"]
-        self.result.component_key = self.component_key
+        self.component_key = "component"
+        self.result.component_key = "component"
         pref_label = self.preferred_component
         self.result.component_order = [pref_label, ".+"]
         names = set(lower_map)
@@ -805,19 +827,24 @@ class _Collector:
 
         stall_pack = next((p for p in self.packs if p.label == "stall"), self.packs[0])
         for pack in self.packs:
+            self._query_priority_logs(pack, ds)
             self._query_panels(pack, ds)
-            self._query_priority_logs(pack, ds, urn_is_label)
-        self._query_stall_cluster(stall_pack, ds, urn_is_label)
+        self._query_stall_stats(stall_pack, ds)
 
         if self._debug_dropped:
             self.result.notes.append(
-                f"dropped {self._debug_dropped} debug/info lines"
+                f"dropped {self._debug_dropped} LEVEL=debug lines"
+            )
+        passes = self.result.level_pass
+        if any(v == "info" for v in passes.values()):
+            self.result.notes.append(
+                "warn/error/alert LEVEL pass returned 0 lines; packed LEVEL=INFO fallback"
             )
         if not self._kept_lines:
             self.result.notes.append(
-                "No alert/error/warn Loki lines for stale URNs after querying "
-                f"{self.component_key}={self.preferred_component} then All "
-                "over stall and recent windows; debug/info excluded and not backfilled."
+                "No LEVEL=alert|error|warn or LEVEL=INFO Loki lines for stale URNs "
+                f"after querying component={self.preferred_component} then All "
+                "over stall and recent windows; LEVEL=debug not queried."
             )
             self.call(
                 "check_datasources_health",
@@ -863,68 +890,105 @@ class _Collector:
         if not self._panel_exprs:
             return
         time_args = self._time_args(pack, ds)
+        level_pass = self.result.level_pass.get(pack.label) or "warn"
+        variables = {
+            "component": self.preferred_component,
+            "env": self.env,
+            "level": self.level,
+        }
         for expr in self._panel_exprs:
             rewritten = rewrite_panel_logql(
-                expr, env=self.env, level=self.level, urns=self.urns
+                expr,
+                env=self.env,
+                level=self.level,
+                urns=self.urns,
+                variables=variables,
+                level_pass=level_pass if level_pass != "none" else "warn",
             )
+            if rewritten is None:
+                self.result.notes.append(
+                    "skipped panel LogQL still containing ${ after substitution"
+                )
+                continue
             payload = self.call(
                 "query_loki_logs",
                 {**time_args, "logql": rewritten, "limit": self.line_limit},
             )
             if payload is not None:
-                self.ingest_lines(payload, component_hint=self.preferred_component)
+                self.ingest_lines(
+                    payload,
+                    component_hint=self.preferred_component,
+                    level_pass=level_pass if level_pass != "none" else "warn",
+                )
 
-    def _query_priority_logs(
-        self, pack: TimePack, ds: str, urn_is_label: bool
-    ) -> None:
+    def _run_logql_list(
+        self,
+        pack: TimePack,
+        ds: str,
+        queries: list[str],
+        *,
+        level_pass: str,
+    ) -> int:
         time_args = self._time_args(pack, ds)
-        per_urn = pack.label == "stall" or pack.label.startswith("urn:")
-        queries = build_priority_logql(
-            self.urns,
-            env=self.env,
-            component_key=self.component_key,
-            preferred_component=self.preferred_component,
-            include_per_urn=per_urn,
-        )
-        if urn_is_label and self.urns and self.preferred_component not in {".+", "all", "*"}:
-            urn_sel = stream_selector(
-                {"env": self.env, "component": self.preferred_component},
-                urns=self.urns,
-                urn_is_label=True,
-                component_key=self.component_key,
-            )
-            queries.insert(0, f"{urn_sel} {severity_line_filter()}")
+        raw_lines = 0
         for query in queries:
             hint = (
                 self.preferred_component
-                if f'{self.component_key}="{self.preferred_component}"' in query
-                or f"{self.component_key}={self.preferred_component}" in query
+                if 'component="distribution"' in query
+                or f'component="{self.preferred_component}"' in query
                 else None
             )
             payload = self.call(
                 "query_loki_logs",
                 {**time_args, "logql": query, "limit": self.line_limit},
             )
+            raw_lines += len(_log_entries(payload)) if payload is not None else 0
             if payload is not None:
-                self.ingest_lines(payload, component_hint=hint)
+                self.ingest_lines(
+                    payload, component_hint=hint, level_pass=level_pass
+                )
+        return raw_lines
 
-    def _query_stall_cluster(
-        self, pack: TimePack, ds: str, urn_is_label: bool
-    ) -> None:
-        time_args = self._time_args(pack, ds)
-        selector = env_component_selector(
-            self.env, self.component_key, self.preferred_component
+    def _query_priority_logs(self, pack: TimePack, ds: str) -> None:
+        per_urn = pack.label == "stall" or pack.label.startswith("urn:")
+        warn_queries = build_priority_logql(
+            self.urns,
+            preferred_component=self.preferred_component,
+            include_per_urn=per_urn,
+            level_pass="warn",
         )
-        if urn_is_label and self.urns:
-            selector = stream_selector(
-                {"env": self.env, "component": self.preferred_component},
-                urns=self.urns,
-                urn_is_label=True,
-                component_key=self.component_key,
+        warn_raw = self._run_logql_list(pack, ds, warn_queries, level_pass="warn")
+        if warn_raw > 0:
+            self.result.level_pass[pack.label] = "warn"
+            return
+        info_queries = build_priority_logql(
+            self.urns,
+            preferred_component=self.preferred_component,
+            include_per_urn=per_urn,
+            level_pass="info",
+        )
+        info_raw = self._run_logql_list(pack, ds, info_queries, level_pass="info")
+        if info_raw > 0:
+            self.result.level_pass[pack.label] = "info"
+            return
+        if self.include_debug:
+            debug_queries = build_priority_logql(
+                self.urns,
+                preferred_component=self.preferred_component,
+                include_per_urn=per_urn,
+                level_pass="debug",
             )
+            debug_raw = self._run_logql_list(
+                pack, ds, debug_queries, level_pass="debug"
+            )
+            self.result.level_pass[pack.label] = "debug" if debug_raw else "none"
+            return
+        self.result.level_pass[pack.label] = "none"
+
+    def _query_stall_stats(self, pack: TimePack, ds: str) -> None:
+        time_args = self._time_args(pack, ds)
+        selector = component_selector(self.preferred_component)
         self.call("query_loki_stats", {**time_args, "logql": selector})
-        self.call("query_loki_patterns", {**time_args, "logql": selector})
-        self.call("find_error_pattern_logs", {**time_args, "logql": selector})
 
 
 def _public_args(arguments: dict[str, Any]) -> dict[str, Any]:

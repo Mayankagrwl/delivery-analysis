@@ -12,9 +12,10 @@ SYSTEM_PROMPT = (
     f"You are a distribution / SRM DeliveryRequest RCA assistant (prompt {PROMPT_VERSION}). "
     "Use only the text inside <EVIDENCE>. "
     "Do not invent URNs, timestamps, LogQL, or dashboard names. "
-    "Use only alert/error/warn lines; prefer component=distribution. "
+    "Prefer component=distribution. Use LEVEL=alert/error/warn lines when present; "
+    "if evidence only has LEVEL=INFO, cite those. "
     "Do not invent a cause for a URN with no such citation. "
-    "cannot_determine=true is required when no error/warn cites that URN. "
+    "cannot_determine=true is required when no error/warn/info cites that URN. "
     "Explain why DeliveryRequest records may be stuck in SUBMITTED or GRANTED past 24h. "
     "Solutions must be operational (replay, unlock, downstream dependency, auth, quota, "
     "Loki-confirmed error class) and tied to citations. "
@@ -59,9 +60,10 @@ def build_messages(
             "content": (
                 f"{evidence}\n\n"
                 "Diagnose why these DeliveryRequests are stale. "
-                "Use only alert/error/warn lines; prefer component=distribution; "
-                "do not invent a cause for a URN with no such citation; "
-                "cannot_determine=true is required when no error/warn cites that URN. "
+                "Prefer component=distribution. Use LEVEL=alert/error/warn when present; "
+                "LEVEL=INFO is allowed when that is the collected pass. "
+                "Do not invent a cause for a URN with no such citation; "
+                "cannot_determine=true is required when no error/warn/info cites that URN. "
                 "JSON only, citations from <EVIDENCE>."
             ),
         },
@@ -118,13 +120,19 @@ def _evidence_lines(srm: SrmResult, grafana: Any | None) -> list[str]:
     if not dist and not other:
         dist = list(getattr(grafana, "highlights", None) or [])
     lines.append("### loki_logs")
-    lines.append("component=distribution alert/error/warn")
+    passes = getattr(grafana, "level_pass", None) or {}
+    if passes:
+        lines.append(
+            "level_pass="
+            + ",".join(f"{key}={value}" for key, value in passes.items())
+        )
+    lines.append("component=distribution LEVEL= line filter")
     if not dist:
         lines.append("(none)")
     for line in dist:
         lines.append(line)
     lines.append("### loki_logs_other")
-    lines.append("other components alert/error/warn")
+    lines.append("other components LEVEL= line filter")
     if not other:
         lines.append("(none)")
     for line in other:

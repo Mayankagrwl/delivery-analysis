@@ -81,13 +81,20 @@ def _grafana_inventory(grafana: Any | None, verdict: str) -> list[str]:
     parts.append(f"- Loki datasource: `{ds}`{ds_name}")
     env = getattr(grafana, "env", None) or (grafana.filters or {}).get("env")
     if env:
-        parts.append(f"- Env: `{env}`")
+        parts.append(f"- Dashboard env (not a Loki label): `{env}`")
     order = list(getattr(grafana, "component_order", None) or [])
     if order:
         parts.append("- Component order: " + ", then ".join(f"`{item}`" for item in order))
-    levels = list(getattr(grafana, "levels", None) or [])
-    if levels:
-        parts.append("- Levels: " + ", ".join(levels) + " (debug/info excluded)")
+    parts.append(
+        "- Level line filter: `LEVEL=(alert|error|warn|...)` then "
+        "`LEVEL=(INFO|info)` fallback; debug only if INCLUDE_DEBUG_LOGS"
+    )
+    passes = getattr(grafana, "level_pass", None) or {}
+    if passes:
+        parts.append(
+            "- Level pass: "
+            + ", ".join(f"{key}={value}" for key, value in passes.items())
+        )
     ranges = list(getattr(grafana, "time_ranges", None) or [])
     if not ranges and grafana.time_range:
         ranges = [grafana.time_range]

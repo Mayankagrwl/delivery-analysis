@@ -139,6 +139,7 @@ class Settings:
     grafana_dashboard_filters: dict[str, str] = field(default_factory=dict)
     loki_line_limit: int = DEFAULT_LINE_LIMIT
     loki_max_queries: int = DEFAULT_MAX_QUERIES
+    include_debug_logs: bool = False
     query_grafana_on_empty: bool = False
     query_grafana_on_srm_error: bool = False
     mcp_tool_timeout: float = DEFAULT_MCP_TOOL_TIMEOUT
@@ -217,6 +218,7 @@ def load_settings(
         loki_max_queries=int(
             _env("LOKI_MAX_QUERIES", str(DEFAULT_MAX_QUERIES)) or DEFAULT_MAX_QUERIES
         ),
+        include_debug_logs=_as_bool(_env("INCLUDE_DEBUG_LOGS"), False),
         query_grafana_on_empty=False,
         query_grafana_on_srm_error=_as_bool(_env("QUERY_GRAFANA_ON_SRM_ERROR"), False),
         mcp_tool_timeout=float(

@@ -134,16 +134,13 @@ class SseParseTests(unittest.TestCase):
 
 class LogqlTests(unittest.TestCase):
     def test_label_selector_preferred(self) -> None:
-        query = stream_selector(
-            {},
-            urns=["strn:distribution:DeliveryRequest:300"],
-            urn_is_label=True,
-        )
-        self.assertEqual(query, '{urn="strn:distribution:DeliveryRequest:300"}')
+        query = stream_selector({"component": "distribution"})
+        self.assertEqual(query, '{component="distribution"}')
 
     def test_line_filter_uses_full_urn(self) -> None:
-        selector = stream_selector({})
+        selector = stream_selector({"component": "distribution"})
         query = urn_line_filter(selector, ["strn:distribution:DeliveryRequest:300"])
+        self.assertIn('{component="distribution"}', query)
         self.assertIn('|= "strn:distribution:DeliveryRequest:300"', query)
         json_query = urn_json_filter(selector, ["strn:distribution:DeliveryRequest:300"])
         self.assertIn("strn:distribution:DeliveryRequest:300", json_query)
@@ -153,24 +150,28 @@ class LogqlTests(unittest.TestCase):
         query = stream_selector(
             {"env": "prod", "component": "distribution", "level": "error"}
         )
-        self.assertEqual(
-            query, '{env="prod", component="distribution", level="error"}'
-        )
+        self.assertEqual(query, '{component="distribution"}')
+        self.assertNotIn("{env=", query)
+        self.assertNotIn("{level=", query)
 
     def test_error_query(self) -> None:
-        query = error_logql(stream_selector({}))
+        query = error_logql(stream_selector({"component": "distribution"}))
         self.assertIn("DeliveryRequest", query)
+        self.assertIn("LEVEL=", query)
         self.assertIn("error", query)
         self.assertIn("alert", query)
         self.assertIn("warn", query)
+        self.assertNotIn("{env=", query)
+        self.assertNotIn("{level=", query)
 
     def test_regex_level_matcher(self) -> None:
-        query = stream_selector(
-            {"env": "production", "level": "alert|error|warn"}
+        queries = build_priority_logql(
+            ["strn:distribution:DeliveryRequest:43"], include_per_urn=False
         )
-        self.assertEqual(
-            query, '{env="production", level=~"alert|error|warn"}'
-        )
+        self.assertTrue(queries[0].startswith('{component="distribution"}'))
+        self.assertIn("LEVEL=(alert|error|warn|ALERT|ERROR|WARN)", queries[0])
+        self.assertNotIn("{env=", queries[0])
+        self.assertNotIn("{level=", queries[0])
 
 
 class GrafanaCollectTests(unittest.TestCase):
@@ -214,13 +215,14 @@ class GrafanaCollectTests(unittest.TestCase):
                         )
                     )
                     logql = [args.get("logql") for _, args in logql_calls]
+                    joined = "\n".join(str(q) for q in logql)
                     self.assertTrue(any("strn:distribution:DeliveryRequest" in str(q) for q in logql))
-                    self.assertTrue(
-                        any(
-                            "env=\"prod\"" in str(q) and "component=\"distribution\"" in str(q)
-                            for q in logql
-                        )
-                    )
+                    self.assertIn('{component="distribution"}', joined)
+                    self.assertIn("LEVEL=", joined)
+                    self.assertNotIn("{env=", joined)
+                    self.assertNotIn("{level=", joined)
+                    self.assertNotIn("query_loki_patterns", names)
+                    self.assertNotIn("find_error_pattern_logs", names)
                     dash_args = [args for name, args in fake.calls if name.startswith("get_dashboard")]
                     self.assertTrue(all(args.get("uid") == DEFAULT_DASHBOARD_UID for args in dash_args))
                     grafana = json.loads((Path(tmp) / "grafana.json").read_text(encoding="utf-8"))
@@ -243,7 +245,12 @@ class GrafanaCollectTests(unittest.TestCase):
         grafana = collect_grafana(srm, settings, client=fake)
         self.assertTrue(grafana.urn_is_label)
         logql = [args["logql"] for name, args in fake.calls if name == "query_loki_logs"]
-        self.assertTrue(any(str(q).startswith("{urn=") or "urn=~" in str(q) for q in logql))
+        joined = "\n".join(str(q) for q in logql)
+        self.assertIn('{component="distribution"}', joined)
+        self.assertIn('|= "strn:distribution:DeliveryRequest:', joined)
+        self.assertNotIn("{urn=", joined)
+        self.assertNotIn("{env=", joined)
+        self.assertNotIn("{level=", joined)
 
     def test_fresh_does_not_call_mcp(self) -> None:
         fake = FakeMcp()
@@ -442,9 +449,9 @@ class GrafanaCollectTests(unittest.TestCase):
         self.assertIn("2026-08-27T15:30:43Z", summary)
         self.assertIn("2026-09-18T12:18:28Z", summary)
         self.assertIn("2026-09-19T12:18:28Z", summary)
-        self.assertIn("Env:", summary)
         self.assertIn("Component order:", summary)
-        self.assertIn("Levels:", summary)
+        self.assertIn("Level pass:", summary)
+        self.assertIn("Level line filter:", summary)
         self.assertFalse(
             any((call.error or "") == "LogQL query budget reached" for call in grafana.tools)
         )
@@ -490,10 +497,11 @@ class GrafanaCollectTests(unittest.TestCase):
         )
         all_i = next(i for i, query in enumerate(logql) if 'component=~".+"' in query)
         self.assertLess(dist_i, all_i)
-        self.assertTrue(any('env="production"' in query for query in logql))
-        self.assertTrue(
-            any("alert|error|warn|fail|timeout|denied|exception" in query for query in logql)
-        )
+        joined = "\n".join(logql)
+        self.assertIn("LEVEL=", joined)
+        self.assertNotIn("{env=", joined)
+        self.assertNotIn("{level=", joined)
+        self.assertNotIn("SERVICE=", joined)
         self.assertTrue(
             any("strn:distribution:DeliveryRequest:(38|39|40|43)" in query for query in logql)
             or any("DeliveryRequest:38" in query for query in logql)
@@ -555,13 +563,13 @@ class GrafanaCollectTests(unittest.TestCase):
         self.assertEqual(grafana.distribution_lines, [])
         self.assertEqual(grafana.other_lines, [])
         evidence, _, _ = build_evidence(srm, grafana)
-        self.assertIn("component=distribution alert/error/warn", evidence)
+        self.assertIn("component=distribution LEVEL= line filter", evidence)
         self.assertIn("(none)", evidence)
         self.assertTrue(
-            any("alert/error/warn" in note for note in grafana.notes),
+            any("LEVEL=alert|error|warn" in note or "LEVEL=INFO" in note for note in grafana.notes),
             grafana.notes,
         )
-        self.assertTrue(any("debug/info" in note for note in grafana.notes), grafana.notes)
+        self.assertTrue(any("debug" in note.lower() for note in grafana.notes), grafana.notes)
 
     def test_dashboard_filters_override_defaults(self) -> None:
         fake = FakeMcp(responses=_default_responses())
@@ -575,9 +583,10 @@ class GrafanaCollectTests(unittest.TestCase):
         }
         grafana = collect_grafana(srm, settings, client=fake)
         logql = [args["logql"] for name, args in fake.calls if name == "query_loki_logs"]
-        self.assertTrue(any('env="staging"' in query for query in logql))
-        self.assertTrue(any('component="gateway"' in query for query in logql))
-        self.assertFalse(any('env="production"' in query for query in logql))
+        joined = "\n".join(logql)
+        self.assertIn('component="gateway"', joined)
+        self.assertNotIn("{env=", joined)
+        self.assertNotIn("{level=", joined)
         self.assertEqual(grafana.env, "staging")
         panel = [args for name, args in fake.calls if name == "get_dashboard_panel_queries"]
         self.assertEqual(panel[0]["variables"]["env"], "staging")
@@ -603,15 +612,85 @@ class GrafanaCollectTests(unittest.TestCase):
             "strn:distribution:DeliveryRequest:43",
         ]
         queries = build_priority_logql(urns)
-        self.assertTrue(queries[0].startswith('{env="production", component="distribution"}'))
+        self.assertTrue(queries[0].startswith('{component="distribution"}'))
+        self.assertIn("LEVEL=(alert|error|warn|ALERT|ERROR|WARN)", queries[0])
         self.assertIn('component=~".+"', queries[-1])
         dist_i = next(i for i, q in enumerate(queries) if 'component="distribution"' in q)
         all_i = next(i for i, q in enumerate(queries) if 'component=~".+"' in q)
         self.assertLess(dist_i, all_i)
         self.assertTrue(any("38|39|40|43" in q for q in queries))
         joined = "\n".join(queries)
+        self.assertNotIn("{env=", joined)
+        self.assertNotIn("{level=", joined)
         self.assertNotIn("udevopsdm", joined)
         self.assertNotIn("username", joined.lower())
+        info = build_priority_logql(urns, level_pass="info")
+        self.assertIn("LEVEL=(INFO|info)", info[0])
+        self.assertTrue(info[0].startswith('{component="distribution"}'))
+
+    def test_explore_logql_has_component_and_level_line_filter(self) -> None:
+        fake = FakeMcp(responses=_default_responses())
+        srm = evaluate_payload(SCREENSHOT_PAYLOAD, as_of=SCREENSHOT_AS_OF)
+        settings = load_settings()
+        settings.grafana_mcp_url = "https://grafana-mcp.example.st.com/sse"
+        collect_grafana(srm, settings, client=fake)
+        logql = [args["logql"] for name, args in fake.calls if name == "query_loki_logs"]
+        joined = "\n".join(logql)
+        self.assertIn('{component="distribution"}', joined)
+        self.assertIn("LEVEL=", joined)
+        self.assertNotIn("{env=", joined)
+        self.assertNotIn("{level=", joined)
+        self.assertNotIn("{SERVICE=", joined)
+        self.assertFalse(any(name == "query_loki_patterns" for name, _ in fake.calls))
+        self.assertFalse(any(name == "find_error_pattern_logs" for name, _ in fake.calls))
+
+    def test_info_fallback_when_warn_pass_empty(self) -> None:
+        def logs(args: dict) -> dict:
+            query = str(args.get("logql") or "")
+            if "LEVEL=(INFO|info)" in query:
+                return {
+                    "data": [
+                        {
+                            "line": "LEVEL=INFO grant worker strn:distribution:DeliveryRequest:43",
+                            "timestamp": "2026-08-27T09:00:00Z",
+                        }
+                    ]
+                }
+            return {"data": []}
+
+        responses = _default_responses()
+        responses["query_loki_logs"] = logs
+        fake = FakeMcp(responses=responses)
+        srm = evaluate_payload(SCREENSHOT_PAYLOAD, as_of=SCREENSHOT_AS_OF)
+        settings = load_settings()
+        settings.grafana_mcp_url = "https://grafana-mcp.example.st.com/sse"
+        grafana = collect_grafana(srm, settings, client=fake)
+        logql = [args["logql"] for name, args in fake.calls if name == "query_loki_logs"]
+        joined = "\n".join(logql)
+        self.assertIn("LEVEL=(alert|error|warn|ALERT|ERROR|WARN)", joined)
+        self.assertIn("LEVEL=(INFO|info)", joined)
+        self.assertTrue(any("LEVEL=INFO" in line for line in grafana.highlights))
+        self.assertIn("info", grafana.level_pass.values())
+        summary = render_summary_md(srm, grafana=grafana)
+        self.assertIn("Level pass:", summary)
+        self.assertIn("info", summary)
+
+    def test_skips_panel_logql_with_unresolved_vars(self) -> None:
+        responses = _default_responses()
+        responses["get_dashboard_panel_queries"] = [
+            {"title": "logs", "expr": '{component="${missing}"} |= "DeliveryRequest"'}
+        ]
+        fake = FakeMcp(responses=responses)
+        srm = evaluate_payload(SCREENSHOT_PAYLOAD, as_of=SCREENSHOT_AS_OF)
+        settings = load_settings()
+        settings.grafana_mcp_url = "https://grafana-mcp.example.st.com/sse"
+        grafana = collect_grafana(srm, settings, client=fake)
+        logql = [args["logql"] for name, args in fake.calls if name == "query_loki_logs"]
+        self.assertFalse(any("${" in str(q) for q in logql))
+        self.assertTrue(
+            any("still containing ${" in note for note in grafana.notes),
+            grafana.notes,
+        )
 
 
 if __name__ == "__main__":
