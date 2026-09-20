@@ -15,6 +15,7 @@ from src.delivery_analysis.grafana import (
     DEFAULT_DASHBOARD_UID,
     LOGQL_TOOLS,
     WRITE_TOOLS,
+    build_priority_logql,
     build_time_packs,
     collect_grafana,
     error_logql,
@@ -22,6 +23,7 @@ from src.delivery_analysis.grafana import (
     urn_json_filter,
     urn_line_filter,
 )
+from src.delivery_analysis.prompt import build_evidence
 from src.delivery_analysis.report import render_summary_md
 from src.delivery_analysis.mcp_sse import iter_sse_events, unwrap_tool_result
 from src.delivery_analysis.verdict import evaluate_payload
@@ -159,6 +161,16 @@ class LogqlTests(unittest.TestCase):
         query = error_logql(stream_selector({}))
         self.assertIn("DeliveryRequest", query)
         self.assertIn("error", query)
+        self.assertIn("alert", query)
+        self.assertIn("warn", query)
+
+    def test_regex_level_matcher(self) -> None:
+        query = stream_selector(
+            {"env": "production", "level": "alert|error|warn"}
+        )
+        self.assertEqual(
+            query, '{env="production", level=~"alert|error|warn"}'
+        )
 
 
 class GrafanaCollectTests(unittest.TestCase):
@@ -422,14 +434,17 @@ class GrafanaCollectTests(unittest.TestCase):
             starts,
         )
         labels = {rng.get("label") for rng in grafana.time_ranges}
-        self.assertIn("now-24h", labels)
+        self.assertIn("recent", labels)
         self.assertIn("stall", labels)
         summary = render_summary_md(srm, grafana=grafana)
         self.assertIn("Time ranges:", summary)
         self.assertIn("2026-08-26T13:19:56Z", summary)
-        self.assertIn("2026-08-27T11:30:43Z", summary)
+        self.assertIn("2026-08-27T15:30:43Z", summary)
         self.assertIn("2026-09-18T12:18:28Z", summary)
         self.assertIn("2026-09-19T12:18:28Z", summary)
+        self.assertIn("Env:", summary)
+        self.assertIn("Component order:", summary)
+        self.assertIn("Levels:", summary)
         self.assertFalse(
             any((call.error or "") == "LogQL query budget reached" for call in grafana.tools)
         )
@@ -438,11 +453,11 @@ class GrafanaCollectTests(unittest.TestCase):
         as_of = datetime(2026, 9, 19, 12, 18, 28, tzinfo=timezone.utc)
         srm = evaluate_payload(SCREENSHOT_PAYLOAD, as_of=as_of)
         packs = build_time_packs(srm)
-        self.assertEqual([p.label for p in packs], ["now-24h", "stall"])
-        self.assertEqual(packs[0].start, "2026-09-18T12:18:28Z")
-        self.assertEqual(packs[0].end, "2026-09-19T12:18:28Z")
-        self.assertEqual(packs[1].start, "2026-08-26T13:19:56Z")
-        self.assertEqual(packs[1].end, "2026-08-27T11:30:43Z")
+        self.assertEqual([p.label for p in packs], ["stall", "recent"])
+        self.assertEqual(packs[0].start, "2026-08-26T13:19:56Z")
+        self.assertEqual(packs[0].end, "2026-08-27T15:30:43Z")
+        self.assertEqual(packs[1].start, "2026-09-18T12:18:28Z")
+        self.assertEqual(packs[1].end, "2026-09-19T12:18:28Z")
 
         wide = [
             {
@@ -459,9 +474,144 @@ class GrafanaCollectTests(unittest.TestCase):
         wide_srm = evaluate_payload(wide, as_of=as_of)
         wide_packs = build_time_packs(wide_srm)
         labels = [p.label for p in wide_packs]
-        self.assertEqual(labels[0], "now-24h")
+        self.assertEqual(labels[-1], "recent")
         self.assertNotIn("stall", labels)
         self.assertTrue(any(label.startswith("urn:") for label in labels))
+
+    def test_distribution_queries_before_all_components(self) -> None:
+        fake = FakeMcp(responses=_default_responses())
+        srm = evaluate_payload(SCREENSHOT_PAYLOAD, as_of=SCREENSHOT_AS_OF)
+        settings = load_settings()
+        settings.grafana_mcp_url = "https://grafana-mcp.example.st.com/sse"
+        collect_grafana(srm, settings, client=fake)
+        logql = [args["logql"] for name, args in fake.calls if name == "query_loki_logs"]
+        dist_i = next(
+            i for i, query in enumerate(logql) if 'component="distribution"' in query
+        )
+        all_i = next(i for i, query in enumerate(logql) if 'component=~".+"' in query)
+        self.assertLess(dist_i, all_i)
+        self.assertTrue(any('env="production"' in query for query in logql))
+        self.assertTrue(
+            any("alert|error|warn|fail|timeout|denied|exception" in query for query in logql)
+        )
+        self.assertTrue(
+            any("strn:distribution:DeliveryRequest:(38|39|40|43)" in query for query in logql)
+            or any("DeliveryRequest:38" in query for query in logql)
+        )
+
+    def test_debug_info_not_packed_when_error_exists(self) -> None:
+        def logs(_args: dict) -> dict:
+            return {
+                "data": [
+                    {
+                        "line": "level=debug ping strn:distribution:DeliveryRequest:43",
+                        "timestamp": "1",
+                    },
+                    {
+                        "line": "level=error timeout strn:distribution:DeliveryRequest:43",
+                        "timestamp": "2",
+                    },
+                    {
+                        "line": "level=info started strn:distribution:DeliveryRequest:38",
+                        "timestamp": "3",
+                    },
+                ]
+            }
+
+        responses = _default_responses()
+        responses["query_loki_logs"] = logs
+        fake = FakeMcp(responses=responses)
+        srm = evaluate_payload(SCREENSHOT_PAYLOAD, as_of=SCREENSHOT_AS_OF)
+        settings = load_settings()
+        settings.grafana_mcp_url = "https://grafana-mcp.example.st.com/sse"
+        grafana = collect_grafana(srm, settings, client=fake)
+        packed = grafana.distribution_lines + grafana.other_lines + grafana.highlights
+        self.assertTrue(any("level=error" in line for line in packed))
+        self.assertFalse(any("level=debug" in line for line in packed))
+        self.assertFalse(any("level=info" in line for line in packed))
+        evidence, _, _ = build_evidence(srm, grafana)
+        self.assertIn("level=error", evidence)
+        self.assertNotIn("level=debug", evidence)
+        self.assertNotIn("level=info", evidence)
+
+    def test_only_debug_leaves_error_warn_list_empty(self) -> None:
+        def logs(_args: dict) -> dict:
+            return {
+                "data": [
+                    {
+                        "line": "level=debug hello strn:distribution:DeliveryRequest:43",
+                        "timestamp": "1",
+                    }
+                ]
+            }
+
+        responses = _default_responses()
+        responses["query_loki_logs"] = logs
+        fake = FakeMcp(responses=responses)
+        srm = evaluate_payload(SCREENSHOT_PAYLOAD, as_of=SCREENSHOT_AS_OF)
+        settings = load_settings()
+        settings.grafana_mcp_url = "https://grafana-mcp.example.st.com/sse"
+        grafana = collect_grafana(srm, settings, client=fake)
+        self.assertEqual(grafana.distribution_lines, [])
+        self.assertEqual(grafana.other_lines, [])
+        evidence, _, _ = build_evidence(srm, grafana)
+        self.assertIn("component=distribution alert/error/warn", evidence)
+        self.assertIn("(none)", evidence)
+        self.assertTrue(
+            any("alert/error/warn" in note for note in grafana.notes),
+            grafana.notes,
+        )
+        self.assertTrue(any("debug/info" in note for note in grafana.notes), grafana.notes)
+
+    def test_dashboard_filters_override_defaults(self) -> None:
+        fake = FakeMcp(responses=_default_responses())
+        srm = evaluate_payload(SCREENSHOT_PAYLOAD, as_of=SCREENSHOT_AS_OF)
+        settings = load_settings()
+        settings.grafana_mcp_url = "https://grafana-mcp.example.st.com/sse"
+        settings.grafana_dashboard_filters = {
+            "env": "staging",
+            "component": "gateway",
+            "level": "error",
+        }
+        grafana = collect_grafana(srm, settings, client=fake)
+        logql = [args["logql"] for name, args in fake.calls if name == "query_loki_logs"]
+        self.assertTrue(any('env="staging"' in query for query in logql))
+        self.assertTrue(any('component="gateway"' in query for query in logql))
+        self.assertFalse(any('env="production"' in query for query in logql))
+        self.assertEqual(grafana.env, "staging")
+        panel = [args for name, args in fake.calls if name == "get_dashboard_panel_queries"]
+        self.assertEqual(panel[0]["variables"]["env"], "staging")
+
+    def test_default_filters_are_production_distribution(self) -> None:
+        env = os.environ.copy()
+        env.pop("GRAFANA_DASHBOARD_FILTERS", None)
+        with patch.dict(os.environ, env, clear=True):
+            settings = load_settings()
+        self.assertEqual(settings.grafana_dashboard_filters.get("env"), "production")
+        self.assertEqual(
+            settings.grafana_dashboard_filters.get("component"), "distribution"
+        )
+        self.assertEqual(
+            settings.grafana_dashboard_filters.get("level"), "alert|error|warn"
+        )
+
+    def test_priority_logql_order_for_screenshot_urns(self) -> None:
+        urns = [
+            "strn:distribution:DeliveryRequest:38",
+            "strn:distribution:DeliveryRequest:39",
+            "strn:distribution:DeliveryRequest:40",
+            "strn:distribution:DeliveryRequest:43",
+        ]
+        queries = build_priority_logql(urns)
+        self.assertTrue(queries[0].startswith('{env="production", component="distribution"}'))
+        self.assertIn('component=~".+"', queries[-1])
+        dist_i = next(i for i, q in enumerate(queries) if 'component="distribution"' in q)
+        all_i = next(i for i, q in enumerate(queries) if 'component=~".+"' in q)
+        self.assertLess(dist_i, all_i)
+        self.assertTrue(any("38|39|40|43" in q for q in queries))
+        joined = "\n".join(queries)
+        self.assertNotIn("udevopsdm", joined)
+        self.assertNotIn("username", joined.lower())
 
 
 if __name__ == "__main__":

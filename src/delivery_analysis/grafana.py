@@ -8,8 +8,11 @@ from typing import Any, NamedTuple
 from pydantic import BaseModel, Field
 
 from .config import (
+    DEFAULT_COMPONENT,
     DEFAULT_DASHBOARD_TITLE,
     DEFAULT_DASHBOARD_UID,
+    DEFAULT_ENV,
+    DEFAULT_LEVELS,
     DEFAULT_LINE_LIMIT,
     DEFAULT_MAX_QUERIES,
     LOGQL_TEMPLATES_PER_PACK,
@@ -30,11 +33,28 @@ WRITE_TOOLS = {
     "update_datasource",
     "update_incident",
 }
-LOGQL_TOOLS = {"query_loki_logs", "query_loki_stats", "query_loki_patterns"}
+LOGQL_TOOLS = {
+    "query_loki_logs",
+    "query_loki_stats",
+    "query_loki_patterns",
+    "find_error_pattern_logs",
+}
 TOKEN_RE = re.compile(r"(?i)(bearer\s+)\S+")
 URN_ID_RE = re.compile(r"strn:distribution:DeliveryRequest:(\d+)")
-STALL_PAD = timedelta(hours=2)
+STALL_PAD_BEFORE = timedelta(hours=2)
+STALL_PAD_AFTER = timedelta(hours=6)
 MAX_COMBINED_STALL = timedelta(days=7)
+SEVERITY_PATTERN = "(?i)alert|error|warn|fail|timeout|denied|exception"
+DEBUG_LEVELS = {"debug", "info"}
+KEEP_LEVELS = {"alert", "error", "warn", "warning", "fatal", "critical"}
+LEVEL_RE = re.compile(
+    r'(?i)(?:level["\']?\s*[:=]\s*["\']?|\[)(alert|error|warn(?:ing)?|debug|info|fatal|critical)\b'
+)
+COMPONENT_RE = re.compile(
+    r'(?i)(?:component|service)["\']?\s*[:=]\s*["\']?([A-Za-z0-9_.:-]+)'
+)
+SELECTOR_RE = re.compile(r"\{([^}]*)\}")
+PANEL_EXPR_KEYS = {"expr", "logql", "query", "exprraw", "rawsql"}
 
 
 class ToolCallLog(BaseModel):
@@ -70,6 +90,14 @@ class GrafanaResult(BaseModel):
     highlights: list[str] = Field(default_factory=list)
     urn_is_label: bool | None = None
     filters: dict[str, str] = Field(default_factory=dict)
+    env: str | None = None
+    component_key: str = "component"
+    component_order: list[str] = Field(default_factory=list)
+    levels: list[str] = Field(default_factory=list)
+    level_counts: dict[str, int] = Field(default_factory=dict)
+    component_counts: dict[str, int] = Field(default_factory=dict)
+    distribution_lines: list[str] = Field(default_factory=list)
+    other_lines: list[str] = Field(default_factory=list)
 
 
 class TimePack(NamedTuple):
@@ -83,11 +111,11 @@ def _fmt_utc(dt: datetime) -> str:
 
 
 def build_time_packs(result: SrmResult) -> list[TimePack]:
-    """now-24h plus stall window around stale updated_on (UTC)."""
+    """stall (updated_on-2h..+6h) then recent (now-24h..now), UTC."""
     as_of = result.as_of.astimezone(UTC)
     hours = result.stale_hours if result.stale_hours else 24
     now_start = (as_of - timedelta(hours=hours)).astimezone(UTC)
-    packs = [TimePack(_fmt_utc(now_start), _fmt_utc(as_of), "now-24h")]
+    recent = TimePack(_fmt_utc(now_start), _fmt_utc(as_of), "recent")
 
     stale_times: list[datetime] = []
     stale_recs: list[Any] = []
@@ -97,23 +125,25 @@ def build_time_packs(result: SrmResult) -> list[TimePack]:
             stale_times.append(when)
             stale_recs.append(rec)
     if not stale_times:
-        return packs
+        return [recent]
 
-    stall_start = min(stale_times) - STALL_PAD
-    stall_end = max(stale_times) + STALL_PAD
+    stall_start = min(stale_times) - STALL_PAD_BEFORE
+    stall_end = max(stale_times) + STALL_PAD_AFTER
     if stall_end - stall_start <= MAX_COMBINED_STALL:
-        packs.append(TimePack(_fmt_utc(stall_start), _fmt_utc(stall_end), "stall"))
-        return packs
+        return [
+            TimePack(_fmt_utc(stall_start), _fmt_utc(stall_end), "stall"),
+            recent,
+        ]
 
-    for rec in stale_recs:
-        when = rec.updated_on_utc.astimezone(UTC)
-        packs.append(
-            TimePack(
-                _fmt_utc(when - STALL_PAD),
-                _fmt_utc(when + STALL_PAD),
-                f"urn:{rec.urn}",
-            )
+    packs = [
+        TimePack(
+            _fmt_utc(rec.updated_on_utc.astimezone(UTC) - STALL_PAD_BEFORE),
+            _fmt_utc(rec.updated_on_utc.astimezone(UTC) + STALL_PAD_AFTER),
+            f"urn:{rec.urn}",
         )
+        for rec in stale_recs
+    ]
+    packs.append(recent)
     return packs
 
 
@@ -125,17 +155,43 @@ def _escape_regex(value: str) -> str:
     return re.escape(value)
 
 
+def _is_regex_value(value: str) -> bool:
+    raw = value.strip()
+    if raw.lower() in {"all", "*"}:
+        return True
+    if raw.startswith("~") or raw == ".+":
+        return True
+    return any(ch in raw for ch in "|*+")
+
+
+def _label_pair(key: str, value: str) -> str:
+    raw = value.strip()
+    if raw.lower() in {"all", "*"}:
+        raw = ".+"
+    if raw.startswith("~"):
+        raw = raw[1:].strip().strip('"')
+    if _is_regex_value(value) or raw == ".+":
+        return f'{key}=~"{raw}"'
+    return f'{key}="{_escape_label(raw)}"'
+
+
 def stream_selector(
     filters: dict[str, str],
     *,
     urns: list[str] | None = None,
     urn_is_label: bool = False,
+    component_key: str = "component",
 ) -> str:
     parts: list[str] = []
-    for key in ("env", "component", "level"):
-        value = filters.get(key)
-        if value:
-            parts.append(f'{key}="{_escape_label(value)}"')
+    env = filters.get("env")
+    if env:
+        parts.append(_label_pair("env", env))
+    comp = filters.get("component") or filters.get(component_key)
+    if comp:
+        parts.append(_label_pair(component_key, comp))
+    level = filters.get("level")
+    if level:
+        parts.append(_label_pair("level", level))
     if urn_is_label and urns:
         if len(urns) == 1:
             parts.append(f'urn="{_escape_label(urns[0])}"')
@@ -143,8 +199,21 @@ def stream_selector(
             joined = "|".join(_escape_regex(u) for u in urns)
             parts.append(f'urn=~"{joined}"')
     if not parts:
-        parts.append('component=~".+"')
+        parts.append(f'{component_key}=~".+"')
     return "{" + ", ".join(parts) + "}"
+
+
+def env_component_selector(env: str, component_key: str, component_value: str) -> str:
+    return (
+        "{"
+        + ", ".join(
+            [
+                _label_pair("env", env),
+                _label_pair(component_key, component_value),
+            ]
+        )
+        + "}"
+    )
 
 
 def urn_line_filter(selector: str, urns: list[str]) -> str:
@@ -173,7 +242,132 @@ def urn_json_filter(selector: str, urns: list[str]) -> str:
 
 
 def error_logql(selector: str) -> str:
-    return f'{selector} |= "DeliveryRequest" |~ "(?i)error|fail|timeout|denied|exception"'
+    return f'{selector} |= "DeliveryRequest" |~ "{SEVERITY_PATTERN}"'
+
+
+def urn_match_filter(urns: list[str]) -> str:
+    if not urns:
+        return '|= "strn:distribution:DeliveryRequest"'
+    if len(urns) == 1:
+        return f'|= "{_escape_label(urns[0])}"'
+    ids: list[str] = []
+    for urn in urns:
+        match = URN_ID_RE.search(urn)
+        ids.append(match.group(1) if match else _escape_regex(urn))
+    return f'|~ "strn:distribution:DeliveryRequest:({"|".join(ids)})"'
+
+
+def severity_line_filter() -> str:
+    return f'|~ "{SEVERITY_PATTERN}"'
+
+
+def preferred_component_value(filters: dict[str, str]) -> str:
+    raw = (filters.get("component") or filters.get("SERVICE") or DEFAULT_COMPONENT).strip()
+    if raw.lower() in {"all", "*", ".+"}:
+        return ".+"
+    if raw.startswith("~"):
+        return raw[1:].strip().strip('"') or DEFAULT_COMPONENT
+    return raw or DEFAULT_COMPONENT
+
+
+def build_priority_logql(
+    urns: list[str],
+    *,
+    env: str = DEFAULT_ENV,
+    component_key: str = "component",
+    preferred_component: str = DEFAULT_COMPONENT,
+    include_per_urn: bool = True,
+) -> list[str]:
+    """Ordered LogQL: preferred component first, then All. No usernames."""
+    sev = severity_line_filter()
+    combined = urn_match_filter(urns)
+    queries: list[str] = []
+    pref = preferred_component or DEFAULT_COMPONENT
+    skip_pref = pref in {".+", "all", "All", "*"}
+    if not skip_pref:
+        dist = env_component_selector(env, component_key, pref)
+        queries.append(f"{dist} {combined} {sev}")
+        if include_per_urn and len(urns) > 1:
+            for urn in urns:
+                queries.append(f'{dist} |= "{_escape_label(urn)}" {sev}')
+    all_sel = env_component_selector(env, component_key, ".+")
+    queries.append(f"{all_sel} {combined} {sev}")
+    return queries
+
+
+def classify_level(line: str) -> str | None:
+    match = LEVEL_RE.search(line)
+    if not match:
+        return None
+    value = match.group(1).lower()
+    if value == "warning":
+        return "warn"
+    return value
+
+
+def classify_component(line: str) -> str | None:
+    match = COMPONENT_RE.search(line)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _panel_logql(payload: Any) -> list[str]:
+    found: list[str] = []
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if (
+                    str(key).lower() in PANEL_EXPR_KEYS
+                    and isinstance(value, str)
+                    and "{" in value
+                ):
+                    found.append(value)
+                else:
+                    walk(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(payload)
+    # preserve order, drop dupes
+    out: list[str] = []
+    seen: set[str] = set()
+    for expr in found:
+        if expr not in seen:
+            seen.add(expr)
+            out.append(expr)
+    return out
+
+
+def rewrite_panel_logql(
+    expr: str,
+    *,
+    env: str,
+    level: str,
+    urns: list[str],
+) -> str:
+    def repl(match: re.Match[str]) -> str:
+        inner = match.group(1)
+        parts = [p.strip() for p in inner.split(",") if p.strip()]
+        kept: list[str] = []
+        for part in parts:
+            key = part.split("=", 1)[0].strip()
+            if key.lower() in {"env", "level"}:
+                continue
+            kept.append(part)
+        injected = [_label_pair("env", env), _label_pair("level", level)] + kept
+        return "{" + ", ".join(injected) + "}"
+
+    out = SELECTOR_RE.sub(repl, expr, count=1)
+    urn_f = urn_match_filter(urns)
+    if urns and "DeliveryRequest" not in out:
+        out = f"{out} {urn_f}"
+    sev = severity_line_filter()
+    if SEVERITY_PATTERN not in out and "alert|error|warn" not in out:
+        out = f"{out} {sev}"
+    return out
 
 
 def stale_urns(result: SrmResult) -> list[str]:
@@ -356,11 +550,21 @@ class _Collector:
         self.line_chars = DEFAULT_LINE_CHARS
         self.timeout = float(getattr(settings, "mcp_tool_timeout", 30.0))
         self.filters = dict(getattr(settings, "grafana_dashboard_filters", {}) or {})
+        self.env = (self.filters.get("env") or DEFAULT_ENV).strip() or DEFAULT_ENV
+        self.level = (self.filters.get("level") or DEFAULT_LEVELS).strip() or DEFAULT_LEVELS
+        self.preferred_component = preferred_component_value(self.filters)
+        self.component_key = "component"
         self.urns = stale_urns(srm)
         self.packs = build_time_packs(srm)
         first = self.packs[0]
         self.start = first.start
         self.end = first.end
+        level_list = [part.strip() for part in self.level.split("|") if part.strip()]
+        pref_label = (
+            ".+"
+            if self.preferred_component in {".+", "all", "*"}
+            else self.preferred_component
+        )
         self.result = GrafanaResult(
             mcp_url_host=mcp_host(getattr(settings, "grafana_mcp_url", "") or ""),
             transport="sse",
@@ -372,11 +576,19 @@ class _Collector:
             time_range={"start": first.start, "end": first.end, "label": first.label},
             time_ranges=[],
             filters=self.filters,
+            env=self.env,
+            component_key=self.component_key,
+            component_order=[pref_label, ".+"],
+            levels=level_list,
         )
         self._token = getattr(settings, "grafana_mcp_token", None)
         self._seen_lines: set[tuple[str, str]] = set()
         self._range_keys: set[tuple[str, str]] = set()
         self._kept_lines: list[str] = []
+        self._distribution_lines: list[str] = []
+        self._other_lines: list[str] = []
+        self._debug_dropped = 0
+        self._panel_exprs: list[str] = []
 
     def _allowed(self, name: str) -> bool:
         if name in WRITE_TOOLS or name.startswith(WRITE_TOOL_PREFIXES):
@@ -463,39 +675,69 @@ class _Collector:
             entry["label"] = label
         self.result.time_ranges.append(entry)
 
-    def _raise_query_budget(self, urn_is_label: bool) -> None:
-        templates = LOGQL_TEMPLATES_PER_PACK
-        if urn_is_label:
-            templates = LOGQL_TEMPLATES_PER_PACK - 1
-        required = templates * len(self.packs)
+    def _raise_query_budget(self, n_panel: int) -> None:
+        n_time = max(1, len(self.packs))
+        n_combined = n_time * 2
+        n_per_urn = len(self.urns) if len(self.urns) > 1 else 0
+        n_cluster = 3
+        required = max(
+            LOGQL_TEMPLATES_PER_PACK * n_time,
+            n_combined + n_per_urn + n_cluster + n_panel * n_time,
+        )
         if self.max_queries < required:
             self.result.notes.append(
                 f"raised Loki query budget {self.max_queries} → {required} "
-                f"({templates} templates × {len(self.packs)} time packs)"
+                f"(stall×distribution+all, {n_time} time packs)"
             )
             self.max_queries = required
 
-    def ingest_lines(self, payload: Any) -> list[str]:
+    def ingest_lines(
+        self,
+        payload: Any,
+        *,
+        component_hint: str | None = None,
+    ) -> list[str]:
         kept: list[str] = []
         if payload is None:
             return kept
+        preferred = self.preferred_component
         for ts, line in _log_entries(payload):
             trimmed, discarded = truncate_line(line, self.line_chars)
             redacted, n = redact_text(trimmed, self._token)
             self.result.redactions += n
             if discarded:
                 self.result.lines_discarded += 1
+            level = classify_level(redacted)
+            if level in DEBUG_LEVELS:
+                self.result.lines_discarded += 1
+                self._debug_dropped += 1
+                continue
             key = (ts, redacted)
             if key in self._seen_lines:
                 self.result.lines_discarded += 1
                 continue
             self._seen_lines.add(key)
-            if len(kept) < self.line_limit:
-                kept.append(redacted)
-                self._kept_lines.append(redacted)
-                self.result.lines_kept += 1
-            else:
+            if len(kept) >= self.line_limit:
                 self.result.lines_discarded += 1
+                continue
+            kept.append(redacted)
+            self._kept_lines.append(redacted)
+            self.result.lines_kept += 1
+            level_key = level or "unknown"
+            self.result.level_counts[level_key] = (
+                self.result.level_counts.get(level_key, 0) + 1
+            )
+            component = classify_component(redacted) or component_hint or "unknown"
+            self.result.component_counts[component] = (
+                self.result.component_counts.get(component, 0) + 1
+            )
+            is_preferred = (
+                preferred not in {".+", "all", "*"} and component == preferred
+            )
+            if is_preferred:
+                self._distribution_lines.append(redacted)
+            else:
+                self._other_lines.append(redacted)
         return kept
 
     def run(self) -> GrafanaResult:
@@ -509,10 +751,14 @@ class _Collector:
             self.result.dashboard_title = title
         if folder:
             self.result.dashboard_folder = folder
-        panel_args: dict[str, Any] = {"uid": uid}
-        if self.filters:
-            panel_args["variables"] = self.filters
-        self.call("get_dashboard_panel_queries", panel_args)
+        panel_vars = {
+            "env": self.env,
+            self.component_key: self.preferred_component,
+            "level": self.level,
+        }
+        panel_args: dict[str, Any] = {"uid": uid, "variables": panel_vars}
+        panel_payload = self.call("get_dashboard_panel_queries", panel_args)
+        self._panel_exprs = _panel_logql(panel_payload)
 
         ds_payload = self.call("list_datasources", {"type": "loki"})
         if ds_payload is None:
@@ -535,7 +781,16 @@ class _Collector:
             "endRfc3339": self.end,
         }
         names_payload = self.call("list_loki_label_names", dict(time_args))
-        names = {n.lower() for n in _label_names(names_payload)}
+        raw_names = _label_names(names_payload)
+        lower_map = {n.lower(): n for n in raw_names}
+        if "component" in lower_map:
+            self.component_key = lower_map["component"]
+        elif "service" in lower_map:
+            self.component_key = lower_map["service"]
+        self.result.component_key = self.component_key
+        pref_label = self.preferred_component
+        self.result.component_order = [pref_label, ".+"]
+        names = set(lower_map)
         urn_is_label = "urn" in names
         if urn_is_label:
             values = _label_values(
@@ -546,15 +801,24 @@ class _Collector:
             )
             urn_is_label = any(u in values for u in self.urns) if values else True
         self.result.urn_is_label = urn_is_label
-        self._raise_query_budget(urn_is_label)
+        self._raise_query_budget(len(self._panel_exprs))
 
-        stats_selector = stream_selector(
-            self.filters, urns=self.urns if urn_is_label else None, urn_is_label=urn_is_label
-        )
+        stall_pack = next((p for p in self.packs if p.label == "stall"), self.packs[0])
         for pack in self.packs:
-            self._query_logql_pack(pack, ds, urn_is_label, stats_selector)
+            self._query_panels(pack, ds)
+            self._query_priority_logs(pack, ds, urn_is_label)
+        self._query_stall_cluster(stall_pack, ds, urn_is_label)
 
+        if self._debug_dropped:
+            self.result.notes.append(
+                f"dropped {self._debug_dropped} debug/info lines"
+            )
         if not self._kept_lines:
+            self.result.notes.append(
+                "No alert/error/warn Loki lines for stale URNs after querying "
+                f"{self.component_key}={self.preferred_component} then All "
+                "over stall and recent windows; debug/info excluded and not backfilled."
+            )
             self.call(
                 "check_datasources_health",
                 {"uids": [ds]},
@@ -582,64 +846,85 @@ class _Collector:
                     self.result.dashboard_url = self.result.dashboard_url or link
 
         self.result.latency_ms = round((time.perf_counter() - started) * 1000, 1)
-        self.result.highlights = self._kept_lines[:8]
+        self.result.distribution_lines = list(self._distribution_lines)
+        self.result.other_lines = list(self._other_lines)
+        self.result.highlights = (self._distribution_lines + self._other_lines)[:8]
         self.result.lines_kept = len(self._kept_lines)
         return self.result
 
-    def _query_logql_pack(
-        self,
-        pack: TimePack,
-        ds: str,
-        urn_is_label: bool,
-        stats_selector: str,
-    ) -> None:
-        time_args = {
+    def _time_args(self, pack: TimePack, ds: str) -> dict[str, Any]:
+        return {
             "datasourceUid": ds,
             "startRfc3339": pack.start,
             "endRfc3339": pack.end,
         }
-        self.call(
-            "query_loki_stats",
-            {**time_args, "logql": stats_selector},
-        )
 
-        if urn_is_label:
-            logs_query = stream_selector(
-                self.filters, urns=self.urns, urn_is_label=True
+    def _query_panels(self, pack: TimePack, ds: str) -> None:
+        if not self._panel_exprs:
+            return
+        time_args = self._time_args(pack, ds)
+        for expr in self._panel_exprs:
+            rewritten = rewrite_panel_logql(
+                expr, env=self.env, level=self.level, urns=self.urns
             )
-        else:
-            logs_query = urn_line_filter(
-                stream_selector(self.filters),
-                self.urns or ["strn:distribution:DeliveryRequest"],
-            )
-        logs = self.call(
-            "query_loki_logs",
-            {**time_args, "logql": logs_query, "limit": self.line_limit},
-        )
-        if logs is not None:
-            self.ingest_lines(logs)
-
-        if not urn_is_label and self.urns:
-            json_query = urn_json_filter(stream_selector(self.filters), self.urns)
-            json_logs = self.call(
+            payload = self.call(
                 "query_loki_logs",
-                {**time_args, "logql": json_query, "limit": self.line_limit},
+                {**time_args, "logql": rewritten, "limit": self.line_limit},
             )
-            if json_logs is not None:
-                self.ingest_lines(json_logs)
+            if payload is not None:
+                self.ingest_lines(payload, component_hint=self.preferred_component)
 
-        error_query = error_logql(stream_selector(self.filters))
-        error_logs = self.call(
-            "query_loki_logs",
-            {**time_args, "logql": error_query, "limit": self.line_limit},
+    def _query_priority_logs(
+        self, pack: TimePack, ds: str, urn_is_label: bool
+    ) -> None:
+        time_args = self._time_args(pack, ds)
+        per_urn = pack.label == "stall" or pack.label.startswith("urn:")
+        queries = build_priority_logql(
+            self.urns,
+            env=self.env,
+            component_key=self.component_key,
+            preferred_component=self.preferred_component,
+            include_per_urn=per_urn,
         )
-        if error_logs is not None:
-            self.ingest_lines(error_logs)
+        if urn_is_label and self.urns and self.preferred_component not in {".+", "all", "*"}:
+            urn_sel = stream_selector(
+                {"env": self.env, "component": self.preferred_component},
+                urns=self.urns,
+                urn_is_label=True,
+                component_key=self.component_key,
+            )
+            queries.insert(0, f"{urn_sel} {severity_line_filter()}")
+        for query in queries:
+            hint = (
+                self.preferred_component
+                if f'{self.component_key}="{self.preferred_component}"' in query
+                or f"{self.component_key}={self.preferred_component}" in query
+                else None
+            )
+            payload = self.call(
+                "query_loki_logs",
+                {**time_args, "logql": query, "limit": self.line_limit},
+            )
+            if payload is not None:
+                self.ingest_lines(payload, component_hint=hint)
 
-        self.call(
-            "query_loki_patterns",
-            {**time_args, "logql": stats_selector},
+    def _query_stall_cluster(
+        self, pack: TimePack, ds: str, urn_is_label: bool
+    ) -> None:
+        time_args = self._time_args(pack, ds)
+        selector = env_component_selector(
+            self.env, self.component_key, self.preferred_component
         )
+        if urn_is_label and self.urns:
+            selector = stream_selector(
+                {"env": self.env, "component": self.preferred_component},
+                urns=self.urns,
+                urn_is_label=True,
+                component_key=self.component_key,
+            )
+        self.call("query_loki_stats", {**time_args, "logql": selector})
+        self.call("query_loki_patterns", {**time_args, "logql": selector})
+        self.call("find_error_pattern_logs", {**time_args, "logql": selector})
 
 
 def _public_args(arguments: dict[str, Any]) -> dict[str, Any]:

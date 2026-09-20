@@ -16,14 +16,20 @@ DEFAULT_MCP_TOOL_TIMEOUT = 30.0
 DEFAULT_DASHBOARD_UID = "d68f5a4d-72e6-4b16-b166-a70f41f3cd49"
 DEFAULT_DASHBOARD_TITLE = "Service Logs"
 DEFAULT_LINE_LIMIT = 200
-DEFAULT_MAX_QUERIES = 16
-LOGQL_TEMPLATES_PER_PACK = 5
+DEFAULT_MAX_QUERIES = 32
+LOGQL_TEMPLATES_PER_PACK = 8
+DEFAULT_ENV = "production"
+DEFAULT_COMPONENT = "distribution"
+DEFAULT_LEVELS = "alert|error|warn"
+DEFAULT_DASHBOARD_FILTERS = (
+    f"env={DEFAULT_ENV},component={DEFAULT_COMPONENT},level={DEFAULT_LEVELS}"
+)
 STGPT_API_URL = "https://api-ai-bridge-dev.st.com/chatgpt/api/client-apps"
 STGPT_CLIENT_APP_NAME = "gtrd_srmtdpplm"
 STGPT_SERVICE = "chat"
 STGPT_VERSION = "1.0"
 PERSONAS = ("trinity_for_api", "alfred_for_api")
-PROMPT_VERSION = "srm.s3.1"
+PROMPT_VERSION = "srm.s3.2"
 TOKEN_BUDGET_TOTAL = 6000
 STGPT_TIMEOUT_SECONDS = 60.0
 
@@ -66,6 +72,13 @@ def parse_dashboard_filters(raw: str | None) -> dict[str, str]:
         if key and value:
             out[key] = value
     return out
+
+
+def _resolve_dashboard_filters(raw: str | None) -> dict[str, str]:
+    merged = parse_dashboard_filters(DEFAULT_DASHBOARD_FILTERS)
+    overrides = parse_dashboard_filters(raw)
+    merged.update(overrides)
+    return merged
 
 
 def resolve_stgpt_api_key(explicit: str | None = None) -> str | None:
@@ -197,7 +210,9 @@ def load_settings(
         or DEFAULT_DASHBOARD_UID,
         grafana_dashboard_title=_env("GRAFANA_DASHBOARD_TITLE", DEFAULT_DASHBOARD_TITLE)
         or DEFAULT_DASHBOARD_TITLE,
-        grafana_dashboard_filters=parse_dashboard_filters(_env("GRAFANA_DASHBOARD_FILTERS")),
+        grafana_dashboard_filters=_resolve_dashboard_filters(
+            _env("GRAFANA_DASHBOARD_FILTERS")
+        ),
         loki_line_limit=int(_env("LOKI_LINE_LIMIT", str(DEFAULT_LINE_LIMIT)) or DEFAULT_LINE_LIMIT),
         loki_max_queries=int(
             _env("LOKI_MAX_QUERIES", str(DEFAULT_MAX_QUERIES)) or DEFAULT_MAX_QUERIES

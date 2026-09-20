@@ -79,6 +79,15 @@ def _grafana_inventory(grafana: Any | None, verdict: str) -> list[str]:
     ds = grafana.loki_datasource_uid or "(not resolved)"
     ds_name = f" ({grafana.loki_datasource_name})" if grafana.loki_datasource_name else ""
     parts.append(f"- Loki datasource: `{ds}`{ds_name}")
+    env = getattr(grafana, "env", None) or (grafana.filters or {}).get("env")
+    if env:
+        parts.append(f"- Env: `{env}`")
+    order = list(getattr(grafana, "component_order", None) or [])
+    if order:
+        parts.append("- Component order: " + ", then ".join(f"`{item}`" for item in order))
+    levels = list(getattr(grafana, "levels", None) or [])
+    if levels:
+        parts.append("- Levels: " + ", ".join(levels) + " (debug/info excluded)")
     ranges = list(getattr(grafana, "time_ranges", None) or [])
     if not ranges and grafana.time_range:
         ranges = [grafana.time_range]
@@ -98,6 +107,18 @@ def _grafana_inventory(grafana: Any | None, verdict: str) -> list[str]:
         parts.append("- LogQL:")
         for query in grafana.logql:
             parts.append(f"  - `{query}`")
+    counts_level = getattr(grafana, "level_counts", None) or {}
+    if counts_level:
+        parts.append(
+            "- Counts by level: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(counts_level.items()))
+        )
+    counts_comp = getattr(grafana, "component_counts", None) or {}
+    if counts_comp:
+        parts.append(
+            "- Counts by component: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(counts_comp.items()))
+        )
     parts.append(f"- Log lines kept: {grafana.lines_kept}")
     parts.append(f"- Log lines discarded (limit/truncate): {grafana.lines_discarded}")
     parts.append(f"- Redactions: {grafana.redactions}")

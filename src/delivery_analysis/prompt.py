@@ -12,6 +12,9 @@ SYSTEM_PROMPT = (
     f"You are a distribution / SRM DeliveryRequest RCA assistant (prompt {PROMPT_VERSION}). "
     "Use only the text inside <EVIDENCE>. "
     "Do not invent URNs, timestamps, LogQL, or dashboard names. "
+    "Use only alert/error/warn lines; prefer component=distribution. "
+    "Do not invent a cause for a URN with no such citation. "
+    "cannot_determine=true is required when no error/warn cites that URN. "
     "Explain why DeliveryRequest records may be stuck in SUBMITTED or GRANTED past 24h. "
     "Solutions must be operational (replay, unlock, downstream dependency, auth, quota, "
     "Loki-confirmed error class) and tied to citations. "
@@ -56,6 +59,9 @@ def build_messages(
             "content": (
                 f"{evidence}\n\n"
                 "Diagnose why these DeliveryRequests are stale. "
+                "Use only alert/error/warn lines; prefer component=distribution; "
+                "do not invent a cause for a URN with no such citation; "
+                "cannot_determine=true is required when no error/warn cites that URN. "
                 "JSON only, citations from <EVIDENCE>."
             ),
         },
@@ -107,6 +113,23 @@ def _evidence_lines(srm: SrmResult, grafana: Any | None) -> list[str]:
         lines.append(reason or "Grafana collection not run")
         return lines
 
+    dist = list(getattr(grafana, "distribution_lines", None) or [])
+    other = list(getattr(grafana, "other_lines", None) or [])
+    if not dist and not other:
+        dist = list(getattr(grafana, "highlights", None) or [])
+    lines.append("### loki_logs")
+    lines.append("component=distribution alert/error/warn")
+    if not dist:
+        lines.append("(none)")
+    for line in dist:
+        lines.append(line)
+    lines.append("### loki_logs_other")
+    lines.append("other components alert/error/warn")
+    if not other:
+        lines.append("(none)")
+    for line in other:
+        lines.append(line)
+
     lines.append("### grafana_dashboard")
     lines.append(
         f"title={grafana.dashboard_title} uid={grafana.dashboard_uid} "
@@ -121,6 +144,15 @@ def _evidence_lines(srm: SrmResult, grafana: Any | None) -> list[str]:
     )
     lines.append("### loki_labels")
     lines.append(f"urn_is_label={grafana.urn_is_label}")
+    env = getattr(grafana, "env", None) or (grafana.filters or {}).get("env")
+    if env:
+        lines.append(f"env={env}")
+    order = list(getattr(grafana, "component_order", None) or [])
+    if order:
+        lines.append("component_order=" + ",".join(order))
+    levels = list(getattr(grafana, "levels", None) or [])
+    if levels:
+        lines.append("levels=" + "|".join(levels))
     if grafana.filters:
         lines.append("filters=" + ",".join(f"{k}={v}" for k, v in grafana.filters.items()))
     lines.append("### loki_stats")
@@ -134,20 +166,26 @@ def _evidence_lines(srm: SrmResult, grafana: Any | None) -> list[str]:
             f"time_range {prefix}{rng.get('start')} … {rng.get('end')}"
         )
     lines.append(f"lines_kept={grafana.lines_kept} lines_discarded={grafana.lines_discarded}")
+    counts_level = getattr(grafana, "level_counts", None) or {}
+    if counts_level:
+        lines.append(
+            "counts_by_level="
+            + ",".join(f"{k}={v}" for k, v in sorted(counts_level.items()))
+        )
+    counts_comp = getattr(grafana, "component_counts", None) or {}
+    if counts_comp:
+        lines.append(
+            "counts_by_component="
+            + ",".join(f"{k}={v}" for k, v in sorted(counts_comp.items()))
+        )
     if grafana.logql:
         for query in grafana.logql:
             lines.append(f"logql: {query}")
-    lines.append("### loki_logs")
-    highlights = list(getattr(grafana, "highlights", None) or [])
-    if not highlights:
-        lines.append("(none)")
-    for line in highlights:
-        lines.append(line)
     lines.append("### loki_patterns")
     pattern_notes = [
         call.error or call.name
         for call in getattr(grafana, "tools", []) or []
-        if getattr(call, "name", "") == "query_loki_patterns"
+        if getattr(call, "name", "") in {"query_loki_patterns", "find_error_pattern_logs"}
     ]
     if pattern_notes:
         lines.extend(str(item) for item in pattern_notes)
