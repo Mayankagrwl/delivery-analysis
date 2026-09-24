@@ -237,8 +237,23 @@ def stream_selector(
     return "{" + ", ".join(parts) + "}"
 
 
-def component_selector(component_value: str) -> str:
-    return "{" + _label_pair("component", component_value) + "}"
+def loki_environment_value(env: str | None) -> str | None:
+    """Map an SRM environment (test/int/qa/demo/prod) to the Loki `environment`
+    label value. prod/production/empty -> "production"; others unchanged.
+    """
+    normalized = (env or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized in {"prod", "production"}:
+        return "production"
+    return normalized
+
+
+def component_selector(component_value: str, environment: str | None = None) -> str:
+    parts = [_label_pair("component", component_value)]
+    if environment:
+        parts.append(_label_pair("environment", environment))
+    return "{" + ", ".join(parts) + "}"
 
 
 def urn_line_filter(selector: str, urns: list[str]) -> str:
@@ -311,8 +326,15 @@ def build_priority_logql(
     preferred_component: str = DEFAULT_COMPONENT,
     include_per_urn: bool = True,
     level_pass: str = "warn",
+    environment: str | None = None,
 ) -> list[str]:
-    """Explore LogQL: {component=...} then URN then LEVEL= line filter. No env/level labels."""
+    """Explore LogQL: {component=[, environment=]} then URN then LEVEL= line filter.
+
+    When ``environment`` is given it is added as a Loki label matcher so queries
+    scope to that environment's logs (multi-env runs); otherwise no env label is
+    emitted (unchanged single-host behavior). ``env`` remains a dashboard-only
+    variable and is not a label.
+    """
     del env, component_key
     sev = severity_line_filter(level_filter_for_pass(level_pass))
     combined = urn_match_filter(urns)
@@ -320,14 +342,14 @@ def build_priority_logql(
     pref = preferred_component or DEFAULT_COMPONENT
     skip_pref = pref in {".+", "all", "All", "*"}
     if not skip_pref:
-        dist = component_selector(pref)
+        dist = component_selector(pref, environment=environment)
         queries.append(f"{dist} {combined} {sev}")
         if include_per_urn and len(urns) > 1:
             for urn in urns:
                 queries.append(f'{dist} |= "{_escape_label(urn)}" {sev}')
         elif include_per_urn and len(urns) == 1:
             queries.append(f'{dist} |= "{_escape_label(urns[0])}" {sev}')
-    all_sel = component_selector(".+")
+    all_sel = component_selector(".+", environment=environment)
     queries.append(f"{all_sel} {combined} {sev}")
     return queries
 
@@ -824,7 +846,20 @@ class _Collector:
         self.line_chars = DEFAULT_LINE_CHARS
         self.timeout = float(getattr(settings, "mcp_tool_timeout", 30.0))
         self.filters = dict(getattr(settings, "grafana_dashboard_filters", {}) or {})
-        self.env = (self.filters.get("env") or DEFAULT_ENV).strip() or DEFAULT_ENV
+        # Scope Grafana/Loki queries to the environment being processed. The
+        # per-env SRM environment (test/int/qa/demo/prod) maps to the Loki
+        # `environment` label value (prod -> "production"); when absent (legacy
+        # single-host runs), no env label is emitted and behavior is unchanged.
+        self.srm_environment = getattr(srm, "environment", None)
+        self.environment_value = loki_environment_value(self.srm_environment)
+        if self.environment_value:
+            self.env = self.environment_value
+        else:
+            self.env = (
+                self.filters.get("environment")
+                or self.filters.get("env")
+                or DEFAULT_ENV
+            ).strip() or DEFAULT_ENV
         self.level = (self.filters.get("level") or DEFAULT_LEVELS).strip() or DEFAULT_LEVELS
         self.preferred_component = preferred_component_value(self.filters)
         self.component_key = "component"
@@ -1263,6 +1298,7 @@ class _Collector:
             preferred_component=self.preferred_component,
             include_per_urn=per_urn,
             level_pass="warn",
+            environment=self.environment_value,
         )
         warn_raw = self._run_logql_list(pack, ds, warn_queries, level_pass="warn")
         if warn_raw > 0:
@@ -1273,6 +1309,7 @@ class _Collector:
             preferred_component=self.preferred_component,
             include_per_urn=per_urn,
             level_pass="info",
+            environment=self.environment_value,
         )
         info_raw = self._run_logql_list(pack, ds, info_queries, level_pass="info")
         if info_raw > 0:
@@ -1284,6 +1321,7 @@ class _Collector:
                 preferred_component=self.preferred_component,
                 include_per_urn=per_urn,
                 level_pass="debug",
+                environment=self.environment_value,
             )
             debug_raw = self._run_logql_list(
                 pack, ds, debug_queries, level_pass="debug"
@@ -1294,7 +1332,9 @@ class _Collector:
 
     def _query_stall_stats(self, pack: TimePack, ds: str) -> None:
         time_args = self._time_args(pack, ds)
-        selector = component_selector(self.preferred_component)
+        selector = component_selector(
+            self.preferred_component, environment=self.environment_value
+        )
         self.call("query_loki_stats", {**time_args, "logql": selector})
 
     def _scan_notification(self, query: str, ds: str) -> list[str]:
@@ -1340,7 +1380,9 @@ class _Collector:
             if self.urns
             else f"strn:distribution:DeliveryRequest:{self.request_id}"
         )
-        selector = component_selector(self.notification_component)
+        selector = component_selector(
+            self.notification_component, environment=self.environment_value
+        )
 
         # Hop 1: notification lines that mention the URN (payload/context).
         context = self._scan_notification(

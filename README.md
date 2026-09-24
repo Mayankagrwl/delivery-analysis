@@ -56,6 +56,8 @@ SRM URLs are derived per environment from a configurable host — nothing is har
 
 **URL precedence:** `--url` (full-URL escape hatch) > `SRM_BASE_URL` env > per-env computed URL.
 
+**Per-env Grafana/Loki scoping.** Each environment's Grafana queries (priority Loki queries and the Notification probe) are scoped to that env via the Loki **`environment`** label so an `ALL` run returns env-specific results instead of the same logs for every env. The SRM env maps to the label value directly except **`prod` → `environment="production"`** (`test`/`int`/`qa`/`demo` are used as-is). `env` remains a dashboard-only variable, not a Loki label.
+
 ### Variables
 
 | Variable | Default | Meaning |
