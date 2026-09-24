@@ -102,11 +102,20 @@ def run_collect_environments(
             any_error = True
         print(f"env={target} verdict={result.verdict}")
 
+    # Collect each env's full per-env report (already written by write_artifacts)
+    # so the top-level summary can embed it after the index table.
+    env_reports: dict[str, str] = {}
+    for target in targets:
+        summary_path = out_root / target / "summary.md"
+        if summary_path.exists():
+            env_reports[target] = summary_path.read_text(encoding="utf-8")
+
     write_index(
         out_root,
         results,
         env_selection=selection_label,
         request_id=scoped_request_id,
+        env_reports=env_reports,
     )
     return MultiEnvResult(
         env_selection=selection_label, results=results, any_error=any_error

@@ -449,6 +449,7 @@ def render_index_md(
     *,
     env_selection: str,
     request_id: str | None = None,
+    env_reports: dict[str, str] | None = None,
 ) -> str:
     """Aggregated top-level index: one row per env, linking to its summary."""
     envs = list(results.keys())
@@ -481,6 +482,18 @@ def render_index_md(
             f"| {env} | {result.verdict} | {_one_line(reason)} | {link} |"
         )
     parts.append("")
+
+    # Embed each env's full per-env report so the Job Summary (which cats this
+    # file) shows the Grafana/Loki evidence and AI analysis, not just the table.
+    if env_reports:
+        for env in envs:
+            report = env_reports.get(env)
+            if not report:
+                continue
+            parts.append(f"## Environment: {env}")
+            parts.append("")
+            parts.append(report.rstrip("\n"))
+            parts.append("")
     return "\n".join(parts)
 
 
@@ -490,9 +503,15 @@ def write_index(
     *,
     env_selection: str,
     request_id: str | None = None,
+    env_reports: dict[str, str] | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "summary.md").write_text(
-        render_index_md(results, env_selection=env_selection, request_id=request_id),
+        render_index_md(
+            results,
+            env_selection=env_selection,
+            request_id=request_id,
+            env_reports=env_reports,
+        ),
         encoding="utf-8",
     )

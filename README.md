@@ -77,7 +77,7 @@ python -m src.delivery_analysis.cli collect --analyze --env prod --request-id 12
 
 ### Artifact layout
 
-Each env writes its own artifacts under `rca-srm/<env>/` (`summary.md`, `srm.json`, `grafana.json`, `analysis.json`). The top-level `rca-srm/summary.md` is an aggregated index: one row per env with its verdict, reason, and a link to that env's `summary.md`. An ALL run isolates failures — one env's error never aborts the others.
+Each env writes its own artifacts under `rca-srm/<env>/` (`summary.md`, `srm.json`, `grafana.json`, `analysis.json`). The top-level `rca-srm/summary.md` is an aggregated index — one row per env with its verdict, reason, and a link to that env's `summary.md` — **followed by each environment's full report** (SRM tables, Grafana/Loki evidence, and the AI analysis with citations) under a `## Environment: <env>` heading. Because the workflow's Job Summary step cats `rca-srm/summary.md`, the Job Summary shows the quick index table and then the complete per-environment detail (a single-env run's Job Summary is equivalent to the pre-multi-env output). An ALL run isolates failures — one env's error never aborts the others.
 
 ## Single-request infra success gate + Tempo trace
 
