@@ -83,7 +83,9 @@ Each env writes its own artifacts under `rca-srm/<env>/` (`summary.md`, `srm.jso
 
 When a run is scoped to one DeliveryRequest (`--request-id` / the `request_id` dispatch input), the **Notification-success probe and Tempo trace always run regardless of the SRM verdict** — `STALE`, `FRESH`, or `NO_RECORDS`. (An id that already completed is normally *not* in `SUBMITTED`/`GRANTED`, so it resolves to `NO_RECORDS`; the completion evidence lives in the logs, not SRM.) `SRM_ERROR` still respects `QUERY_GRAFANA_ON_SRM_ERROR`.
 
-**Notification success gate.** The pipeline probes the **Notification** component logs in Loki for the request URN and looks for either success marker (case-insensitive): `"successfully processed"` (normally a **DEBUG** line) or `"mail sent to"` (normally **INFO**). The probe uses a dedicated `{component="<notification>"} |= "<urn>"` query with **no level filter**, so it finds DEBUG success lines even when `INCLUDE_DEBUG_LOGS` is off. It searches a wide window (`now - REQUEST_ID_LOOKBACK_HOURS .. now`, default 7 days) so an older completed request is still found.
+**Notification success gate.** The pipeline probes the **Notification** component logs in Loki and looks for either success marker (case-insensitive): `"successfully processed"` (normally a **DEBUG** line) or `"mail sent to"` (normally **INFO**). All probe queries omit the level filter, so DEBUG success lines are found even when `INCLUDE_DEBUG_LOGS` is off, and it searches a wide window (`now - REQUEST_ID_LOOKBACK_HOURS .. now`, default 7 days) so an older completed request is still found.
+
+The success markers are logged keyed by a correlation **`requestId`**, not by the DeliveryRequest URN, so the probe correlates in two hops: (1) `{component="<notification>"} |= "<urn>"` finds the payload/context line, which carries the `requestId`; (2) `{component="<notification>"} |= "<requestId>"` finds the success-marker lines. The resolved `requestId` and the number of notification lines scanned are shown in the summary so a miss is easy to diagnose. The correlation field key is `NOTIFICATION_REQUEST_ID_FIELD` (default `requestId`).
 
 The outcome, shown in `## Infra success check (Notification)` and as an **Outcome** line under the verdict:
 
@@ -102,6 +104,7 @@ So AI runs only when the request is actually `STALE`; a non-stale request resolv
 | `TEMPO_ID` | — | Tempo datasource UID for the trace cascade (a variable — never hardcoded). Unset ⇒ trace skipped. |
 | `NOTIFICATION_COMPONENT` | `notification` | Loki `component` value for the notification success probe |
 | `NOTIFICATION_SUCCESS_MARKERS` | `successfully processed\|mail sent to` | Pipe-separated success markers (case-insensitive) |
+| `NOTIFICATION_REQUEST_ID_FIELD` | `requestId` | Correlation-id field tying the URN payload line to the success-marker lines |
 | `TRACE_ID_FIELD` | `trace_id` | Preferred trace-id field key when extracting from log lines |
 | `REQUEST_ID_LOOKBACK_HOURS` | `168` | Notification/Tempo probe window (hours) for a `request_id` run |
 

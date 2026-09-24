@@ -36,6 +36,7 @@ TOKEN_BUDGET_TOTAL = 6000
 STGPT_TIMEOUT_SECONDS = 60.0
 DEFAULT_NOTIFICATION_COMPONENT = "notification"
 DEFAULT_NOTIFICATION_SUCCESS_MARKERS = "successfully processed|mail sent to"
+DEFAULT_NOTIFICATION_REQUEST_ID_FIELD = "requestId"
 DEFAULT_TRACE_ID_FIELD = "trace_id"
 DEFAULT_REQUEST_ID_LOOKBACK_HOURS = 168.0  # 7 days
 
@@ -196,6 +197,7 @@ class Settings:
             m.strip() for m in DEFAULT_NOTIFICATION_SUCCESS_MARKERS.split("|")
         ]
     )
+    notification_request_id_field: str = DEFAULT_NOTIFICATION_REQUEST_ID_FIELD
     tempo_datasource_uid: str | None = None
     trace_id_field: str = DEFAULT_TRACE_ID_FIELD
     request_id_lookback_hours: float = DEFAULT_REQUEST_ID_LOOKBACK_HOURS
@@ -310,6 +312,10 @@ def load_settings(
         notification_success_markers=parse_success_markers(
             _env("NOTIFICATION_SUCCESS_MARKERS")
         ),
+        notification_request_id_field=_env(
+            "NOTIFICATION_REQUEST_ID_FIELD", DEFAULT_NOTIFICATION_REQUEST_ID_FIELD
+        )
+        or DEFAULT_NOTIFICATION_REQUEST_ID_FIELD,
         tempo_datasource_uid=_env("TEMPO_ID"),
         trace_id_field=_env("TRACE_ID_FIELD", DEFAULT_TRACE_ID_FIELD)
         or DEFAULT_TRACE_ID_FIELD,

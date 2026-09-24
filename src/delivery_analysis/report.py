@@ -286,6 +286,9 @@ def _notification_section(result: SrmResult, grafana: Any | None) -> list[str]:
         parts.append("")
         parts.append(f"- Notification component: `{component}`")
         parts.append(f"- Matched marker(s): {', '.join(markers) or '(unknown)'}")
+        rid = getattr(grafana, "notification_request_id", None)
+        if rid:
+            parts.append(f"- Correlation requestId: `{rid}`")
         lines = getattr(grafana, "notification_success_lines", None) or []
         if lines:
             parts.append("- Notification log lines:")
@@ -296,9 +299,11 @@ def _notification_section(result: SrmResult, grafana: Any | None) -> list[str]:
     else:
         lookback = getattr(grafana, "notification_lookback_hours", None)
         window = f" (window: last {int(lookback)}h)" if lookback else ""
+        scanned = getattr(grafana, "notification_lines_scanned", 0)
+        rid = getattr(grafana, "notification_request_id", None)
         if result.verdict == "STALE":
             parts.append(
-                f"NOT FOUND — no `{component}` success log for the request"
+                f"NOT FOUND — no `{component}` success marker for the request"
                 f"{window}; genuine stale incident, STGPT analysis proceeded."
             )
         else:
@@ -307,6 +312,13 @@ def _notification_section(result: SrmResult, grafana: Any | None) -> list[str]:
                 f"{window} — **investigate**. Request is not stale; no AI "
                 "analysis was performed."
             )
+        parts.append("")
+        parts.append(f"- Notification component: `{component}`")
+        parts.append(f"- Notification lines scanned: {scanned}")
+        parts.append(
+            "- Correlation requestId: "
+            + (f"`{rid}`" if rid else "not resolved from URN lines")
+        )
     parts.append("")
     return parts
 

@@ -115,6 +115,8 @@ class GrafanaResult(BaseModel):
     notification_markers_matched: list[str] = Field(default_factory=list)
     notification_component: str | None = None
     notification_lookback_hours: float | None = None
+    notification_request_id: str | None = None
+    notification_lines_scanned: int = 0
     # Tempo trace cascade
     tempo_datasource_uid: str | None = None
     trace_id: str | None = None
@@ -664,8 +666,40 @@ def line_has_stale_urn(line: str, urns: list[str]) -> bool:
 
 
 NOTIFICATION_SUCCESS_CAP = 8
+MAX_NOTIFICATION_REQUEST_IDS = 3
 TEMPO_TOOL_HINTS = ("tempo", "trace")
 _HEX_16_OR_32 = r"([0-9a-fA-F]{32}|[0-9a-fA-F]{16})(?![0-9a-fA-F])"
+
+
+def _request_id_re(field: str | None = None) -> re.Pattern[str]:
+    """Match a correlation request id: the configured field key or variants.
+
+    The notification success markers ("successfully processed", "mail sent to")
+    are keyed by this id, not by the DeliveryRequest URN. Handles JSON
+    (``"requestId":"aq0..."``) and ``key=value`` forms; the value is 8+ chars of
+    ``[A-Za-z0-9_-]`` so it never matches a bare numeric id.
+    """
+    keys = ["request[_-]?id"]
+    if field:
+        esc = re.escape(field.strip())
+        if esc and esc not in keys:
+            keys.insert(0, esc)
+    key_alt = "|".join(keys)
+    return re.compile(
+        rf'(?i)(?:{key_alt})["\']?\s*[:=]\s*["\']?([A-Za-z0-9][A-Za-z0-9_\-]{{7,}})'
+    )
+
+
+def extract_request_ids(lines: list[str], *, field: str = "requestId") -> list[str]:
+    """Ordered, de-duplicated correlation request ids found in the given lines."""
+    pattern = _request_id_re(field)
+    ids: list[str] = []
+    for line in lines:
+        for match in pattern.finditer(line):
+            rid = match.group(1)
+            if rid and rid not in ids:
+                ids.append(rid)
+    return ids
 
 
 def match_success_markers(
@@ -801,6 +835,9 @@ class _Collector:
         )
         self.notification_markers = list(
             getattr(settings, "notification_success_markers", None) or []
+        )
+        self.notification_request_id_field = (
+            getattr(settings, "notification_request_id_field", None) or "requestId"
         )
         self.trace_id_field = getattr(settings, "trace_id_field", "trace_id") or "trace_id"
         self.lookback_hours = float(
@@ -943,9 +980,12 @@ class _Collector:
         n_per_urn = len(self.urns) if len(self.urns) > 1 else 0
         n_passes = 3 if self.include_debug else 2
         n_cluster = 1
-        # In request_id mode reserve budget for the notification probe (one query
-        # per time pack) plus a Tempo trace call.
-        n_probe = (n_time + 2) if self.request_id else 0
+        # In request_id mode reserve budget for the two-hop notification probe
+        # (URN query + one query per resolved requestId, each across time packs)
+        # plus a Tempo trace call.
+        n_probe = (
+            n_time * (1 + MAX_NOTIFICATION_REQUEST_IDS) + 2 if self.request_id else 0
+        )
         required = max(
             LOGQL_TEMPLATES_PER_PACK * n_time * n_passes,
             (n_combined + n_per_urn) * n_passes + n_cluster + n_panel * n_time,
@@ -1257,24 +1297,9 @@ class _Collector:
         selector = component_selector(self.preferred_component)
         self.call("query_loki_stats", {**time_args, "logql": selector})
 
-    def _notification_probe(self, ds: str) -> None:
-        """Query the Notification component for the request URN, including DEBUG.
-
-        Runs only in request_id (single-DR) mode. Uses a dedicated LogQL query
-        with no level filter so the DEBUG "successfully processed" marker is
-        never dropped, regardless of the global INCLUDE_DEBUG_LOGS setting.
-        """
-        self.result.notification_checked = True
-        self.result.notification_component = self.notification_component
-        self.result.notification_lookback_hours = self.lookback_hours
-        target = (
-            self.urns[0]
-            if self.urns
-            else f"strn:distribution:DeliveryRequest:{self.request_id}"
-        )
-        selector = component_selector(self.notification_component)
-        query = f'{selector} |= "{_escape_label(target)}"'
-        scanned: list[str] = []
+    def _scan_notification(self, query: str, ds: str) -> list[str]:
+        """Run a notification LogQL query across all packs; return redacted lines."""
+        out: list[str] = []
         for pack in self.packs:
             payload = self.call(
                 "query_loki_logs",
@@ -1288,8 +1313,56 @@ class _Collector:
                 self.result.redactions += n
                 if truncated:
                     self.result.lines_truncated += 1
-                if redacted not in scanned:
-                    scanned.append(redacted)
+                if redacted not in out:
+                    out.append(redacted)
+        return out
+
+    def _notification_probe(self, ds: str) -> None:
+        """Detect Notification-component completion for the request, incl. DEBUG.
+
+        Runs only in request_id (single-DR) mode. The success markers
+        ("successfully processed" / "mail sent to") are logged keyed by the
+        correlation ``requestId`` — NOT by the DeliveryRequest URN — so a single
+        URN filter misses them. Two-hop:
+
+          1. query the Notification component for the URN (payload/context lines);
+          2. extract the ``requestId`` from those lines and query the Notification
+             component for that id, then scan for the markers.
+
+        All queries omit the level filter so the DEBUG "successfully processed"
+        marker is never dropped, regardless of INCLUDE_DEBUG_LOGS.
+        """
+        self.result.notification_checked = True
+        self.result.notification_component = self.notification_component
+        self.result.notification_lookback_hours = self.lookback_hours
+        target = (
+            self.urns[0]
+            if self.urns
+            else f"strn:distribution:DeliveryRequest:{self.request_id}"
+        )
+        selector = component_selector(self.notification_component)
+
+        # Hop 1: notification lines that mention the URN (payload/context).
+        context = self._scan_notification(
+            f'{selector} |= "{_escape_label(target)}"', ds
+        )
+
+        # Resolve the correlation requestId(s) that tie the URN to the markers.
+        request_ids = extract_request_ids(
+            context, field=self.notification_request_id_field
+        )
+        self.result.notification_request_id = request_ids[0] if request_ids else None
+
+        scanned = list(context)
+        # Hop 2: notification lines for each requestId (where the markers live).
+        for rid in request_ids[:MAX_NOTIFICATION_REQUEST_IDS]:
+            for line in self._scan_notification(
+                f'{selector} |= "{_escape_label(rid)}"', ds
+            ):
+                if line not in scanned:
+                    scanned.append(line)
+
+        self.result.notification_lines_scanned = len(scanned)
         matched_lines, matched_markers = match_success_markers(
             scanned, self.notification_markers
         )
@@ -1301,12 +1374,20 @@ class _Collector:
             self.result.notes.append(
                 "Notification success detected ("
                 + ", ".join(matched_markers)
-                + "); STGPT will be skipped"
+                + f"; requestId={self.result.notification_request_id}); "
+                "STGPT will be skipped"
             )
         else:
+            rid_note = (
+                f"requestId={self.result.notification_request_id}"
+                if self.result.notification_request_id
+                else "no requestId resolved from URN lines"
+            )
             self.result.notes.append(
-                "No Notification success log found for the request; "
-                "analysis proceeds"
+                "No Notification success marker found for the request "
+                f"(component={self.notification_component}, "
+                f"lines_scanned={self.result.notification_lines_scanned}, "
+                f"{rid_note}, window=last {int(self.lookback_hours)}h)"
             )
 
     def _extract_trace_id(self) -> None:
