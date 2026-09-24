@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from .analyze import ChatFn, analyze_staleness, skipped_analysis
+from .analyze import (
+    ChatFn,
+    analyze_staleness,
+    infra_success_record,
+    investigate_record,
+    skipped_analysis,
+)
 from .config import SRM_ENVIRONMENTS, Settings, load_settings, srm_url_for_env
 from .grafana import GrafanaResult, collect_grafana, should_query_grafana, skipped_grafana
 from .mcp_sse import McpClient
@@ -195,8 +201,20 @@ def run_collect(
     if analysis is not None:
         print(f"analysis_status={analysis.status}")
 
+    if scoped_request_id:
+        if getattr(grafana, "notification_success", None) is True:
+            result.request_outcome = "SUCCESS"
+        elif result.verdict == "STALE":
+            result.request_outcome = "STALE (AI analysis)"
+        else:
+            result.request_outcome = "INVESTIGATE (no completion evidence)"
+
     write_artifacts(result, out_path, grafana=grafana, analysis=analysis)
     return result
+
+
+def _request_scoped(result: SrmResult, cfg: Settings) -> bool:
+    return bool(result.request_id or cfg.request_id)
 
 
 def _maybe_grafana(
@@ -204,11 +222,14 @@ def _maybe_grafana(
     cfg: Settings,
     mcp_client: McpClient | None,
 ) -> GrafanaResult:
-    if result.verdict in {"FRESH", "NO_RECORDS"}:
-        return skipped_grafana(reason="skipped (verdict not STALE)")
-    if result.verdict == "SRM_ERROR" and not cfg.query_grafana_on_srm_error:
-        return skipped_grafana(reason="skipped (verdict not STALE)")
-    if not should_query_grafana(
+    if result.verdict == "SRM_ERROR":
+        # SRM_ERROR still respects the explicit opt-in flag, request_id or not.
+        if not cfg.query_grafana_on_srm_error:
+            return skipped_grafana(reason="skipped (verdict SRM_ERROR)")
+    elif _request_scoped(result, cfg):
+        # request_id mode: always probe Notification + Tempo, any verdict.
+        pass
+    elif not should_query_grafana(
         result.verdict, on_srm_error=cfg.query_grafana_on_srm_error
     ):
         return skipped_grafana(reason="skipped (verdict not STALE)")
@@ -233,20 +254,30 @@ def _maybe_analyze(
 ) -> AnalysisRecord | None:
     if not analyze:
         return None
-    if result.verdict != "STALE":
-        return skipped_analysis(reason="skipped (verdict not STALE)")
-    try:
-        return analyze_staleness(
-            result,
-            grafana,
-            url=cfg.stgpt_api_url,
-            client_app_name=cfg.stgpt_client_app_name,
-            chat_fn=chat_fn,
-            cache_dir=cache_dir,
-            token_budget=cfg.token_budget,
+    # Infra success wins in every mode, including a request_id run that is also
+    # STALE (success beats AI analysis).
+    if getattr(grafana, "notification_success", None) is True:
+        return infra_success_record(grafana)
+    if result.verdict == "STALE":
+        try:
+            return analyze_staleness(
+                result,
+                grafana,
+                url=cfg.stgpt_api_url,
+                client_app_name=cfg.stgpt_client_app_name,
+                chat_fn=chat_fn,
+                cache_dir=cache_dir,
+                token_budget=cfg.token_budget,
+            )
+        except Exception as exc:
+            return AnalysisRecord(
+                status="unusable",
+                notes=[exc.__class__.__name__],
+            )
+    if _request_scoped(result, cfg):
+        # Not stale and no completion evidence: investigate, never call STGPT.
+        return investigate_record(
+            result.request_id or cfg.request_id,
+            getattr(cfg, "request_id_lookback_hours", None),
         )
-    except Exception as exc:
-        return AnalysisRecord(
-            status="unusable",
-            notes=[exc.__class__.__name__],
-        )
+    return skipped_analysis(reason="skipped (verdict not STALE)")

@@ -81,14 +81,17 @@ Each env writes its own artifacts under `rca-srm/<env>/` (`summary.md`, `srm.jso
 
 ## Single-request infra success gate + Tempo trace
 
-When a run is scoped to one DeliveryRequest (`--request-id` / the `request_id` dispatch input), two extra steps run on the `STALE` path:
+When a run is scoped to one DeliveryRequest (`--request-id` / the `request_id` dispatch input), the **Notification-success probe and Tempo trace always run regardless of the SRM verdict** — `STALE`, `FRESH`, or `NO_RECORDS`. (An id that already completed is normally *not* in `SUBMITTED`/`GRANTED`, so it resolves to `NO_RECORDS`; the completion evidence lives in the logs, not SRM.) `SRM_ERROR` still respects `QUERY_GRAFANA_ON_SRM_ERROR`.
 
-**Notification success gate.** The pipeline probes the **Notification** component logs in Loki for the request URN and looks for either success marker (case-insensitive): `"successfully processed"` (normally a **DEBUG** line) or `"mail sent to"` (normally **INFO**). The probe uses a dedicated `{component="<notification>"} |= "<urn>"` query with **no level filter**, so it finds DEBUG success lines even when `INCLUDE_DEBUG_LOGS` is off.
+**Notification success gate.** The pipeline probes the **Notification** component logs in Loki for the request URN and looks for either success marker (case-insensitive): `"successfully processed"` (normally a **DEBUG** line) or `"mail sent to"` (normally **INFO**). The probe uses a dedicated `{component="<notification>"} |= "<urn>"` query with **no level filter**, so it finds DEBUG success lines even when `INCLUDE_DEBUG_LOGS` is off. It searches a wide window (`now - REQUEST_ID_LOOKBACK_HOURS .. now`, default 7 days) so an older completed request is still found.
 
-- **Found → SUCCESS:** the request is treated as complete from the infra side. **STGPT is not called.** `analysis.json` records `status="infra_success"`, `fallback_used=false`, `tokens_used=0`, and the matched notification lines as citations. `summary.md` shows a **SUCCESS** banner under `## Infra success check (Notification)`.
-- **Not found:** something went wrong — the existing Grafana + STGPT analysis runs as before, and the section says the success log was not found.
+The outcome, shown in `## Infra success check (Notification)` and as an **Outcome** line under the verdict:
 
-This gate only runs in single-request mode; normal all-records staleness runs record "not applicable".
+- **SUCCESS** — a notification success line was found. The request is complete from the infra side: **STGPT is not called**, `analysis.json` records `status="infra_success"`, `fallback_used=false`, `tokens_used=0`, and the matched notification lines become citations. The Tempo cascade is rendered.
+- **INVESTIGATE** — no success line and the request is **not stale** (`FRESH`/`NO_RECORDS`): the summary states no completion evidence was found in the window and asks you to investigate. **No AI call is made (0 tokens)** — never a bare "not an incident".
+- **STALE incident** — no success line but the request *is* stale: this is a genuine incident, so the existing Grafana + STGPT analysis runs as usual.
+
+So AI runs only when the request is actually `STALE`; a non-stale request resolves to SUCCESS or INVESTIGATE with no tokens spent. Normal all-records staleness runs (no `request_id`) are unchanged — Grafana + STGPT still run only on `STALE` — and the gate records "not applicable".
 
 **Tempo trace cascade.** After collecting logs, the run extracts a trace id from the log lines (field variants `trace_id` / `traceId` / `traceID` / `trace-id`, 16- or 32-char hex). If `TEMPO_ID` is set and a read-only Tempo/trace query tool is available over MCP, it queries Tempo for that trace and renders a cascade table (component/service → span → status → duration) under `## Request trace (Tempo)`. If `TEMPO_ID` is unset, no trace id is found, or no Tempo tool is available, it skips with a clear note and never fails the job. Tempo/trace tools are called read-only; write tools are refused.
 
@@ -100,6 +103,7 @@ This gate only runs in single-request mode; normal all-records staleness runs re
 | `NOTIFICATION_COMPONENT` | `notification` | Loki `component` value for the notification success probe |
 | `NOTIFICATION_SUCCESS_MARKERS` | `successfully processed\|mail sent to` | Pipe-separated success markers (case-insensitive) |
 | `TRACE_ID_FIELD` | `trace_id` | Preferred trace-id field key when extracting from log lines |
+| `REQUEST_ID_LOOKBACK_HOURS` | `168` | Notification/Tempo probe window (hours) for a `request_id` run |
 
 ## Status
 

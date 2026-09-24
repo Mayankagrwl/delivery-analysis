@@ -155,8 +155,8 @@ def evaluate_payload(
         if not records:
             return build(
                 "NO_RECORDS",
-                "Requested DeliveryRequest id "
-                f"{scoped_id} not found in SUBMITTED/GRANTED. Not an incident.",
+                f"Requested id {scoped_id} not in SUBMITTED/GRANTED — "
+                "checking Notification/Tempo for completion.",
                 key_map=key_map,
                 key_inventory_list=inventory,
                 extra_notes=[f"requested id {scoped_id} not present in results"],

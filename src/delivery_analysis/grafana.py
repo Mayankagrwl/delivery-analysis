@@ -114,6 +114,7 @@ class GrafanaResult(BaseModel):
     notification_success_lines: list[str] = Field(default_factory=list)
     notification_markers_matched: list[str] = Field(default_factory=list)
     notification_component: str | None = None
+    notification_lookback_hours: float | None = None
     # Tempo trace cascade
     tempo_datasource_uid: str | None = None
     trace_id: str | None = None
@@ -131,8 +132,18 @@ def _fmt_utc(dt: datetime) -> str:
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def build_time_packs(result: SrmResult) -> list[TimePack]:
-    """stall (updated_on-2h..+6h) then recent (now-24h..now), UTC."""
+def build_time_packs(
+    result: SrmResult,
+    *,
+    request_id: str | None = None,
+    lookback_hours: float | None = None,
+) -> list[TimePack]:
+    """stall (updated_on-2h..+6h) then recent (now-24h..now), UTC.
+
+    In request_id mode a wider ``lookback`` pack (now-lookback..now) is prepended
+    so an older completed request is found; the redundant ``recent`` pack is then
+    dropped since ``lookback`` covers it.
+    """
     as_of = result.as_of.astimezone(UTC)
     hours = result.stale_hours if result.stale_hours else 24
     now_start = (as_of - timedelta(hours=hours)).astimezone(UTC)
@@ -145,27 +156,37 @@ def build_time_packs(result: SrmResult) -> list[TimePack]:
             when = rec.updated_on_utc.astimezone(UTC)
             stale_times.append(when)
             stale_recs.append(rec)
+
     if not stale_times:
-        return [recent]
+        base = [recent]
+    else:
+        stall_start = min(stale_times) - STALL_PAD_BEFORE
+        stall_end = max(stale_times) + STALL_PAD_AFTER
+        if stall_end - stall_start <= MAX_COMBINED_STALL:
+            base = [
+                TimePack(_fmt_utc(stall_start), _fmt_utc(stall_end), "stall"),
+                recent,
+            ]
+        else:
+            base = [
+                TimePack(
+                    _fmt_utc(rec.updated_on_utc.astimezone(UTC) - STALL_PAD_BEFORE),
+                    _fmt_utc(rec.updated_on_utc.astimezone(UTC) + STALL_PAD_AFTER),
+                    f"urn:{rec.urn}",
+                )
+                for rec in stale_recs
+            ]
+            base.append(recent)
 
-    stall_start = min(stale_times) - STALL_PAD_BEFORE
-    stall_end = max(stale_times) + STALL_PAD_AFTER
-    if stall_end - stall_start <= MAX_COMBINED_STALL:
-        return [
-            TimePack(_fmt_utc(stall_start), _fmt_utc(stall_end), "stall"),
-            recent,
-        ]
-
-    packs = [
-        TimePack(
-            _fmt_utc(rec.updated_on_utc.astimezone(UTC) - STALL_PAD_BEFORE),
-            _fmt_utc(rec.updated_on_utc.astimezone(UTC) + STALL_PAD_AFTER),
-            f"urn:{rec.urn}",
+    if request_id and lookback_hours and lookback_hours > 0:
+        lookback = TimePack(
+            _fmt_utc((as_of - timedelta(hours=lookback_hours)).astimezone(UTC)),
+            _fmt_utc(as_of),
+            "lookback",
         )
-        for rec in stale_recs
-    ]
-    packs.append(recent)
-    return packs
+        # lookback subsumes recent; keep stall/per-urn packs for stall detail.
+        return [lookback] + [p for p in base if p.label != "recent"]
+    return base
 
 
 def _escape_label(value: str) -> str:
@@ -782,8 +803,19 @@ class _Collector:
             getattr(settings, "notification_success_markers", None) or []
         )
         self.trace_id_field = getattr(settings, "trace_id_field", "trace_id") or "trace_id"
+        self.lookback_hours = float(
+            getattr(settings, "request_id_lookback_hours", 168.0) or 168.0
+        )
         self.urns = stale_urns(srm)
-        self.packs = build_time_packs(srm)
+        # In request_id mode scope Loki/Tempo to that URN even when no stale
+        # record exists (verdict FRESH/NO_RECORDS), so completion logs are found.
+        if self.request_id and not self.urns:
+            self.urns = [f"strn:distribution:DeliveryRequest:{self.request_id}"]
+        self.packs = build_time_packs(
+            srm,
+            request_id=self.request_id,
+            lookback_hours=self.lookback_hours,
+        )
         first = self.packs[0]
         self.start = first.start
         self.end = first.end
@@ -1234,6 +1266,7 @@ class _Collector:
         """
         self.result.notification_checked = True
         self.result.notification_component = self.notification_component
+        self.result.notification_lookback_hours = self.lookback_hours
         target = (
             self.urns[0]
             if self.urns

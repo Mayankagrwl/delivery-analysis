@@ -180,6 +180,16 @@ def _ai_section(analysis: Any | None, verdict: str) -> list[str]:
         parts.append("")
         return parts
     parts.append(f"- status: `{analysis.status}`")
+    if analysis.status == "investigate":
+        parts.append("")
+        parts.append(
+            "_No AI analysis: the request is not stale and no Notification "
+            "completion evidence was found — investigate._"
+        )
+        for note in list(getattr(analysis, "notes", None) or [])[:3]:
+            parts.append(f"- {note}")
+        parts.append("")
+        return parts
     if analysis.status == "infra_success":
         parts.append("")
         parts.append(
@@ -284,10 +294,19 @@ def _notification_section(result: SrmResult, grafana: Any | None) -> list[str]:
             parts.extend(lines)
             parts.append("```")
     else:
-        parts.append(
-            f"NOT FOUND — no `{component}` success log for the request; "
-            "analysis proceeded."
-        )
+        lookback = getattr(grafana, "notification_lookback_hours", None)
+        window = f" (window: last {int(lookback)}h)" if lookback else ""
+        if result.verdict == "STALE":
+            parts.append(
+                f"NOT FOUND — no `{component}` success log for the request"
+                f"{window}; genuine stale incident, STGPT analysis proceeded."
+            )
+        else:
+            parts.append(
+                f"No completion evidence found for id {result.request_id}"
+                f"{window} — **investigate**. Request is not stale; no AI "
+                "analysis was performed."
+            )
     parts.append("")
     return parts
 
@@ -348,12 +367,18 @@ def render_summary_md(
     title = "# DeliveryRequest staleness"
     if result.environment:
         title += f" — {result.environment}"
-    parts = [
+    verdict_lines = [
         title,
         "",
         "## Verdict",
         "",
         f"**{result.verdict}** — {result.reason}",
+    ]
+    if result.request_outcome:
+        verdict_lines.append("")
+        verdict_lines.append(f"**Outcome:** {result.request_outcome}")
+    parts = [
+        *verdict_lines,
         "",
         "## Window",
         "",
@@ -451,8 +476,9 @@ def render_index_md(
     for env in envs:
         result = results[env]
         link = f"[{env}/summary.md]({env}/summary.md)"
+        reason = result.request_outcome or _one_line(result.reason)
         parts.append(
-            f"| {env} | {result.verdict} | {_one_line(result.reason)} | {link} |"
+            f"| {env} | {result.verdict} | {_one_line(reason)} | {link} |"
         )
     parts.append("")
     return "\n".join(parts)

@@ -39,6 +39,7 @@ class SrmResult(BaseModel):
     url: str | None = None
     environment: str | None = None
     request_id: str | None = None
+    request_outcome: str | None = None
     key_map: KeyMap = Field(default_factory=KeyMap)
     records: list[SrmRecord] = Field(default_factory=list)
     key_inventory: list[str] = Field(default_factory=list)
@@ -76,6 +77,7 @@ AnalysisStatus = Literal[
     "bridge_error",
     "unusable",
     "infra_success",
+    "investigate",
 ]
 
 

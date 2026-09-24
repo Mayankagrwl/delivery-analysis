@@ -200,6 +200,35 @@ def infra_success_record(
     return _redact_record(record)
 
 
+def investigate_record(
+    request_id: str | None, lookback_hours: float | None
+) -> AnalysisRecord:
+    """No-AI 'investigate' record for a non-stale request_id run with no success.
+
+    No bridge call, zero tokens; the summary explains no completion evidence was
+    found and AI was intentionally not run because the request is not stale.
+    """
+    window = (
+        f" (window: last {int(lookback_hours)}h)"
+        if lookback_hours
+        else ""
+    )
+    note = (
+        f"No Notification completion evidence found for id {request_id}{window}; "
+        "request is not stale, so STGPT analysis was intentionally not run."
+    )
+    return AnalysisRecord(
+        status="investigate",
+        prompt_version=PROMPT_VERSION,
+        persona=None,
+        result=None,
+        fallback_used=False,
+        tokens_used=0,
+        analyzed_at=datetime.now(timezone.utc),
+        notes=[note],
+    )
+
+
 def write_analysis(record: AnalysisRecord, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     dump = json.loads(record.model_dump_json())
