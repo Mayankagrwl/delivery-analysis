@@ -54,9 +54,9 @@ SRM URLs are derived per environment from a configurable host — nothing is har
 
 `{host}` defaults to `https://trd.st.com` and is overridable via the `SRM_BASE_HOST` variable.
 
-**URL precedence:** `--url` (full-URL escape hatch) > `SRM_BASE_URL` env > per-env computed URL.
+**URL precedence (single env):** `--url` (full-URL escape hatch) > `SRM_BASE_URL` env > per-env computed URL. The `--url` / `SRM_BASE_URL` override is a **single-env escape hatch and is ignored in an `ALL` run** — otherwise it would collapse all five environments onto one URL (identical data). In `ALL` mode every env always uses its own `srm_url_for_env(env)` URL, and the resolved URL is printed per env and shown in each env's `summary.md` and the top-level index.
 
-**Per-env Grafana/Loki scoping.** Each environment's Grafana queries (priority Loki queries and the Notification probe) are scoped to that env via the Loki **`environment`** label so an `ALL` run returns env-specific results instead of the same logs for every env. The SRM env maps to the label value directly except **`prod` → `environment="production"`** (`test`/`int`/`qa`/`demo` are used as-is). `env` remains a dashboard-only variable, not a Loki label.
+**Per-env Grafana/Loki scoping.** Each environment's Grafana queries — the priority Loki queries, the per-URN queries, the Notification probe, panel-derived queries, and the stats query — are scoped to that env via the Loki **`environment`** label, so an `ALL` run returns env-specific results instead of the same logs for every env. The SRM env maps to the label value directly except **`prod` → `environment="production"`** (`test`/`int`/`qa`/`demo` are used as-is); override the mapping with `GRAFANA_ENV_LABEL_VALUES` (e.g. `prod=production,qa=qa`). `env` remains a dashboard-only variable, not a Loki label, and `environment` is never placed in the SRM URL.
 
 ### Variables
 
@@ -64,7 +64,8 @@ SRM URLs are derived per environment from a configurable host — nothing is har
 |---|---|---|
 | `SRM_BASE_HOST` | `https://trd.st.com` | Host used to build per-env SRM URLs |
 | `SRM_ENV` | `prod` | Default env when no `--env` / dropdown value is given (`ALL` runs every env) |
-| `SRM_BASE_URL` | — | Optional full-URL escape hatch; overrides the computed per-env URL |
+| `SRM_BASE_URL` | — | Optional full-URL escape hatch for a **single** env; ignored in `ALL` runs |
+| `GRAFANA_ENV_LABEL_VALUES` | `prod=production` | Optional SRM-env → Loki `environment` label value map (comma/equals) |
 
 ### CLI
 

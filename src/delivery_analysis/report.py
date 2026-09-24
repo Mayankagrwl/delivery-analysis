@@ -79,9 +79,12 @@ def _grafana_inventory(grafana: Any | None, verdict: str) -> list[str]:
     ds = grafana.loki_datasource_uid or "(not resolved)"
     ds_name = f" ({grafana.loki_datasource_name})" if grafana.loki_datasource_name else ""
     parts.append(f"- Loki datasource: `{ds}`{ds_name}")
+    env_label = getattr(grafana, "environment_label", None)
+    if env_label:
+        parts.append(f"- Loki environment label: `environment=\"{env_label}\"`")
     env = getattr(grafana, "env", None) or (grafana.filters or {}).get("env")
     if env:
-        parts.append(f"- Dashboard env (not a Loki label): `{env}`")
+        parts.append(f"- Dashboard env variable: `{env}`")
     order = list(getattr(grafana, "component_order", None) or [])
     if order:
         parts.append("- Component order: " + ", then ".join(f"`{item}`" for item in order))
@@ -395,6 +398,7 @@ def render_summary_md(
         "## Window",
         "",
         f"- Environment: {result.environment or '(default)'}",
+        f"- SRM URL: {result.url or '(unknown)'}",
         f"- T_now: {_iso(result.as_of)}",
         f"- Timezone: {result.timezone}",
         f"- Stale cutoff: {_iso(result.cutoff)} ({hours}h)",
@@ -482,16 +486,17 @@ def render_index_md(
             "",
             "## Environments",
             "",
-            "| env | verdict | reason | details |",
-            "|---|---|---|---|",
+            "| env | verdict | reason | SRM URL | details |",
+            "|---|---|---|---|---|",
         ]
     )
     for env in envs:
         result = results[env]
         link = f"[{env}/summary.md]({env}/summary.md)"
         reason = result.request_outcome or _one_line(result.reason)
+        url = result.url or "(unknown)"
         parts.append(
-            f"| {env} | {result.verdict} | {_one_line(reason)} | {link} |"
+            f"| {env} | {result.verdict} | {_one_line(reason)} | {url} | {link} |"
         )
     parts.append("")
 

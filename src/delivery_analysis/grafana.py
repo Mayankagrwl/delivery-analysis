@@ -98,6 +98,7 @@ class GrafanaResult(BaseModel):
     urn_is_label: bool | None = None
     filters: dict[str, str] = Field(default_factory=dict)
     env: str | None = None
+    environment_label: str | None = None
     component_key: str = "component"
     component_order: list[str] = Field(default_factory=list)
     levels: list[str] = Field(default_factory=list)
@@ -237,13 +238,18 @@ def stream_selector(
     return "{" + ", ".join(parts) + "}"
 
 
-def loki_environment_value(env: str | None) -> str | None:
+def loki_environment_value(
+    env: str | None, overrides: dict[str, str] | None = None
+) -> str | None:
     """Map an SRM environment (test/int/qa/demo/prod) to the Loki `environment`
-    label value. prod/production/empty -> "production"; others unchanged.
+    label value. prod/production/empty -> "production"; others unchanged. An
+    optional overrides map (from GRAFANA_ENV_LABEL_VALUES) wins when present.
     """
     normalized = (env or "").strip().lower()
     if not normalized:
         return None
+    if overrides and normalized in overrides:
+        return overrides[normalized]
     if normalized in {"prod", "production"}:
         return "production"
     return normalized
@@ -254,6 +260,24 @@ def component_selector(component_value: str, environment: str | None = None) -> 
     if environment:
         parts.append(_label_pair("environment", environment))
     return "{" + ", ".join(parts) + "}"
+
+
+def ensure_environment_label(logql: str, environment: str | None) -> str:
+    """Inject `environment="<value>"` into the first `{...}` selector of a LogQL
+    query when missing, so panel-derived queries scope to the env too.
+    """
+    if not environment:
+        return logql
+
+    def repl(match: re.Match[str]) -> str:
+        inner = match.group(1)
+        if re.search(r"\benvironment\s*=", inner):
+            return match.group(0)
+        pair = _label_pair("environment", environment)
+        inner = inner.strip()
+        return "{" + (f"{inner}, {pair}" if inner else pair) + "}"
+
+    return SELECTOR_RE.sub(repl, logql, count=1)
 
 
 def urn_line_filter(selector: str, urns: list[str]) -> str:
@@ -851,7 +875,10 @@ class _Collector:
         # `environment` label value (prod -> "production"); when absent (legacy
         # single-host runs), no env label is emitted and behavior is unchanged.
         self.srm_environment = getattr(srm, "environment", None)
-        self.environment_value = loki_environment_value(self.srm_environment)
+        self.environment_value = loki_environment_value(
+            self.srm_environment,
+            getattr(settings, "grafana_env_label_values", None),
+        )
         if self.environment_value:
             self.env = self.environment_value
         else:
@@ -909,6 +936,7 @@ class _Collector:
             time_ranges=[],
             filters=self.filters,
             env=self.env,
+            environment_label=self.environment_value,
             component_key=self.component_key,
             component_order=[pref_label, ".+"],
             levels=level_list,
@@ -1252,6 +1280,7 @@ class _Collector:
                     "skipped panel LogQL still containing ${ after substitution"
                 )
                 continue
+            rewritten = ensure_environment_label(rewritten, self.environment_value)
             payload = self.call(
                 "query_loki_logs",
                 {**time_args, "logql": rewritten, "limit": self.line_limit},

@@ -68,10 +68,18 @@ def run_collect_environments(
     out_root = Path(out_dir)
     results: dict[str, SrmResult] = {}
     any_error = False
+    # The full-URL escape hatch (--url / SRM_BASE_URL) applies to a single
+    # explicitly-selected env only. In an ALL / multi-env run it would collapse
+    # every env onto one URL (identical SRM data), so ignore it there and always
+    # use each env's own computed URL.
+    single_env = len(targets) == 1
+    if not single_env and cfg.srm_base_url_override:
+        print("SRM_BASE_URL override ignored in ALL mode; using per-env URLs")
     for target in targets:
-        env_url = cfg.srm_base_url_override or srm_url_for_env(
-            target, host=cfg.srm_base_host
-        )
+        if single_env and cfg.srm_base_url_override:
+            env_url = cfg.srm_base_url_override
+        else:
+            env_url = srm_url_for_env(target, host=cfg.srm_base_host)
         try:
             result = run_collect(
                 as_of=as_of,
@@ -100,7 +108,7 @@ def run_collect_environments(
         results[target] = result
         if result.verdict == "SRM_ERROR":
             any_error = True
-        print(f"env={target} verdict={result.verdict}")
+        print(f"env={target} url={safe_url(env_url)} verdict={result.verdict}")
 
     # Collect each env's full per-env report (already written by write_artifacts)
     # so the top-level summary can embed it after the index table.

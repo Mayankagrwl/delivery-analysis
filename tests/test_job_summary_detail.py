@@ -81,7 +81,7 @@ class TopLevelEmbedTests(unittest.TestCase):
     def test_all_run_embeds_full_reports(self):
         top, per_env, calls = _run("ALL")
         # Index table still present.
-        self.assertIn("| env | verdict | reason | details |", top)
+        self.assertIn("| env | verdict | reason | SRM URL | details |", top)
         for env in SRM_ENVIRONMENTS:
             self.assertIn(f"[{env}/summary.md]({env}/summary.md)", top)
             self.assertIn(f"## Environment: {env}", top)
@@ -102,7 +102,7 @@ class TopLevelEmbedTests(unittest.TestCase):
 
     def test_single_env_top_level_has_full_ai(self):
         top, per_env, calls = _run("qa")
-        self.assertIn("| env | verdict | reason | details |", top)
+        self.assertIn("| env | verdict | reason | SRM URL | details |", top)
         self.assertIn("## Environment: qa", top)
         self.assertIn("## AI analysis", top)
         self.assertIn(ROOT_CAUSE, top)

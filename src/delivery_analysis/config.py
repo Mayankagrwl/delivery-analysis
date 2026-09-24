@@ -41,6 +41,24 @@ DEFAULT_TRACE_ID_FIELD = "trace_id"
 DEFAULT_REQUEST_ID_LOOKBACK_HOURS = 168.0  # 7 days
 
 
+def parse_env_label_values(raw: str | None) -> dict[str, str]:
+    """Parse GRAFANA_ENV_LABEL_VALUES (``prod=production,qa=qa`` form) into a
+    lower-cased map SRM env -> Loki `environment` label value.
+    """
+    out: dict[str, str] = {}
+    if not raw:
+        return out
+    for part in raw.split(","):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key and value:
+            out[key] = value
+    return out
+
+
 def parse_success_markers(raw: str | None) -> list[str]:
     """Parse a pipe-separated marker string into a clean, ordered list."""
     if not raw:
@@ -198,6 +216,7 @@ class Settings:
         ]
     )
     notification_request_id_field: str = DEFAULT_NOTIFICATION_REQUEST_ID_FIELD
+    grafana_env_label_values: dict[str, str] = field(default_factory=dict)
     tempo_datasource_uid: str | None = None
     trace_id_field: str = DEFAULT_TRACE_ID_FIELD
     request_id_lookback_hours: float = DEFAULT_REQUEST_ID_LOOKBACK_HOURS
@@ -316,6 +335,9 @@ def load_settings(
             "NOTIFICATION_REQUEST_ID_FIELD", DEFAULT_NOTIFICATION_REQUEST_ID_FIELD
         )
         or DEFAULT_NOTIFICATION_REQUEST_ID_FIELD,
+        grafana_env_label_values=parse_env_label_values(
+            _env("GRAFANA_ENV_LABEL_VALUES")
+        ),
         tempo_datasource_uid=_env("TEMPO_ID"),
         trace_id_field=_env("TRACE_ID_FIELD", DEFAULT_TRACE_ID_FIELD)
         or DEFAULT_TRACE_ID_FIELD,
