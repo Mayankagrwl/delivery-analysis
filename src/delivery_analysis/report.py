@@ -180,6 +180,26 @@ def _ai_section(analysis: Any | None, verdict: str) -> list[str]:
         parts.append("")
         return parts
     parts.append(f"- status: `{analysis.status}`")
+    if analysis.status == "infra_success":
+        parts.append("")
+        parts.append(
+            "> ✅ **SUCCESS** — request marked successful from infra side; "
+            "no AI analysis needed."
+        )
+        parts.append("")
+        parts.append("- confidence: not applicable")
+        result = analysis.result
+        if result is not None:
+            parts.append(f"**Root cause:** {result.root_cause}")
+            parts.append("")
+            parts.append(f"**Suggested fix:** {result.suggested_fix}")
+            if result.citations:
+                parts.extend(["", "**Citations:**"])
+                for cite in result.citations:
+                    loc = cite.source + (f":{cite.line}" if cite.line else "")
+                    parts.append(f"- `{cite.quote}` ({loc})")
+        parts.append("")
+        return parts
     if analysis.persona:
         parts.append(f"- persona: `{analysis.persona}`")
     if analysis.cache_hit:
@@ -230,6 +250,89 @@ def _ai_raw_section(analysis: Any) -> list[str]:
     return parts
 
 
+def _notification_section(result: SrmResult, grafana: Any | None) -> list[str]:
+    parts = ["## Infra success check (Notification)", ""]
+    if not result.request_id:
+        parts.append(
+            "not applicable (no request_id; multi-record staleness run)"
+        )
+        parts.append("")
+        return parts
+    checked = bool(getattr(grafana, "notification_checked", False)) if grafana else False
+    if not checked:
+        parts.append(
+            "not run (Grafana collection skipped for this verdict)"
+        )
+        parts.append("")
+        return parts
+    component = getattr(grafana, "notification_component", None) or "notification"
+    success = getattr(grafana, "notification_success", None)
+    if success:
+        markers = getattr(grafana, "notification_markers_matched", None) or []
+        parts.append(
+            "**SUCCESS** — request marked successful from infra side — "
+            "no AI analysis needed."
+        )
+        parts.append("")
+        parts.append(f"- Notification component: `{component}`")
+        parts.append(f"- Matched marker(s): {', '.join(markers) or '(unknown)'}")
+        lines = getattr(grafana, "notification_success_lines", None) or []
+        if lines:
+            parts.append("- Notification log lines:")
+            parts.append("")
+            parts.append("```")
+            parts.extend(lines)
+            parts.append("```")
+    else:
+        parts.append(
+            f"NOT FOUND — no `{component}` success log for the request; "
+            "analysis proceeded."
+        )
+    parts.append("")
+    return parts
+
+
+def _trace_section(grafana: Any | None) -> list[str]:
+    parts = ["## Request trace (Tempo)", ""]
+    if grafana is None:
+        parts.append("skipped (Grafana collection not run)")
+        parts.append("")
+        return parts
+    trace_id = getattr(grafana, "trace_id", None)
+    spans = list(getattr(grafana, "trace_spans", None) or [])
+    if not spans:
+        note = None
+        for candidate in getattr(grafana, "notes", None) or []:
+            if candidate.startswith("Tempo trace"):
+                note = candidate
+                break
+        if trace_id:
+            parts.append(f"- trace id: `{trace_id}`")
+        parts.append(note or "no Tempo cascade available")
+        parts.append("")
+        return parts
+    parts.append(f"- trace id: `{trace_id}`")
+    tempo_uid = getattr(grafana, "tempo_datasource_uid", None)
+    if tempo_uid:
+        parts.append(f"- Tempo datasource: `{tempo_uid}`")
+    parts.append("")
+    parts.append("| component/service | span | status | duration_ms |")
+    parts.append("|---|---|---|---|")
+    for span in spans:
+        duration = span.get("duration_ms")
+        duration_text = "" if duration is None else str(duration)
+        parts.append(
+            f"| {span.get('service', '')} | {span.get('name', '')} | "
+            f"{span.get('status', '')} | {duration_text} |"
+        )
+    deeplink = getattr(grafana, "trace_deeplink", None)
+    if deeplink:
+        parts.append("")
+        parts.append(f"- Tempo deeplink: {deeplink}")
+    parts.append("")
+    return parts
+
+
 def render_summary_md(
     result: SrmResult,
     grafana: Any | None = None,
@@ -272,6 +375,8 @@ def render_summary_md(
     ]
     parts.extend(_grafana_inventory(grafana, result.verdict))
     parts.extend(_evidence_highlights(grafana))
+    parts.extend(_notification_section(result, grafana))
+    parts.extend(_trace_section(grafana))
     parts.extend(_ai_section(analysis, result.verdict))
     if result.notes:
         parts.extend(["## Collection notes", ""])

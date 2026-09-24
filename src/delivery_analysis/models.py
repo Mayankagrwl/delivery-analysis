@@ -75,6 +75,7 @@ AnalysisStatus = Literal[
     "citation_invalid",
     "bridge_error",
     "unusable",
+    "infra_success",
 ]
 
 

@@ -108,6 +108,17 @@ class GrafanaResult(BaseModel):
     level_pass: dict[str, str] = Field(default_factory=dict)
     lines_with_stale_urn: int = 0
     lines_truncated: int = 0
+    # Notification success gate (request_id / single-DR mode only)
+    notification_checked: bool = False
+    notification_success: bool | None = None
+    notification_success_lines: list[str] = Field(default_factory=list)
+    notification_markers_matched: list[str] = Field(default_factory=list)
+    notification_component: str | None = None
+    # Tempo trace cascade
+    tempo_datasource_uid: str | None = None
+    trace_id: str | None = None
+    trace_spans: list[dict[str, Any]] = Field(default_factory=list)
+    trace_deeplink: str | None = None
 
 
 class TimePack(NamedTuple):
@@ -631,6 +642,114 @@ def line_has_stale_urn(line: str, urns: list[str]) -> bool:
     return False
 
 
+NOTIFICATION_SUCCESS_CAP = 8
+TEMPO_TOOL_HINTS = ("tempo", "trace")
+_HEX_16_OR_32 = r"([0-9a-fA-F]{32}|[0-9a-fA-F]{16})(?![0-9a-fA-F])"
+
+
+def match_success_markers(
+    lines: list[str], markers: list[str]
+) -> tuple[list[str], list[str]]:
+    """Return (matched_lines, matched_markers), case-insensitive substring match."""
+    matched_lines: list[str] = []
+    matched_markers: list[str] = []
+    for line in lines:
+        low = line.lower()
+        for marker in markers:
+            if marker and marker.lower() in low:
+                if line not in matched_lines:
+                    matched_lines.append(line)
+                if marker not in matched_markers:
+                    matched_markers.append(marker)
+    return matched_lines, matched_markers
+
+
+def _trace_id_re(field: str | None = None) -> re.Pattern[str]:
+    """Match a trace id: the configured field key or common variants + hex value.
+
+    Accepts ``trace_id``, ``traceId``, ``traceID``, ``trace-id`` (and the given
+    ``field``) followed by a 16- or 32-char hex value.
+    """
+    keys = ["trace[_-]?id"]
+    if field:
+        esc = re.escape(field.strip())
+        if esc and esc not in keys:
+            keys.insert(0, esc)
+    key_alt = "|".join(keys)
+    return re.compile(
+        rf'(?i)(?:{key_alt})["\']?\s*[:=]\s*["\']?{_HEX_16_OR_32}'
+    )
+
+
+def extract_trace_id(lines: list[str], *, field: str = "trace_id") -> str | None:
+    pattern = _trace_id_re(field)
+    for line in lines:
+        match = pattern.search(line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _span_field(item: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _trace_span_candidates(payload: Any) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("spans", "data", "traces", "batches", "resourceSpans"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        trace = payload.get("trace")
+        if isinstance(trace, dict) and isinstance(trace.get("spans"), list):
+            return trace["spans"]
+    return []
+
+
+def parse_trace_spans(payload: Any) -> list[dict[str, Any]]:
+    """Tolerantly parse a Tempo trace payload into ordered cascade spans."""
+    spans: list[dict[str, Any]] = []
+    for item in _trace_span_candidates(payload):
+        if not isinstance(item, dict):
+            continue
+        service = _span_field(
+            item, ("service", "component", "serviceName", "service_name")
+        )
+        if service is None and isinstance(item.get("process"), dict):
+            service = item["process"].get("serviceName")
+        name = _span_field(item, ("name", "operationName", "operation", "span"))
+        status = _span_field(
+            item, ("status", "statusCode", "status_code", "state")
+        )
+        duration = _span_field(
+            item, ("duration_ms", "durationMs", "duration", "durationMillis")
+        )
+        spans.append(
+            {
+                "service": str(service) if service is not None else "",
+                "name": str(name) if name is not None else "",
+                "status": str(status) if status is not None else "",
+                "duration_ms": duration
+                if isinstance(duration, (int, float))
+                else _to_float(duration),
+            }
+        )
+    return spans
+
+
 class _Collector:
     def __init__(
         self,
@@ -655,6 +774,14 @@ class _Collector:
         self.preferred_component = preferred_component_value(self.filters)
         self.component_key = "component"
         self.include_debug = bool(getattr(settings, "include_debug_logs", False))
+        self.request_id = getattr(srm, "request_id", None)
+        self.notification_component = (
+            getattr(settings, "notification_component", None) or "notification"
+        )
+        self.notification_markers = list(
+            getattr(settings, "notification_success_markers", None) or []
+        )
+        self.trace_id_field = getattr(settings, "trace_id_field", "trace_id") or "trace_id"
         self.urns = stale_urns(srm)
         self.packs = build_time_packs(srm)
         first = self.packs[0]
@@ -784,10 +911,13 @@ class _Collector:
         n_per_urn = len(self.urns) if len(self.urns) > 1 else 0
         n_passes = 3 if self.include_debug else 2
         n_cluster = 1
+        # In request_id mode reserve budget for the notification probe (one query
+        # per time pack) plus a Tempo trace call.
+        n_probe = (n_time + 2) if self.request_id else 0
         required = max(
             LOGQL_TEMPLATES_PER_PACK * n_time * n_passes,
             (n_combined + n_per_urn) * n_passes + n_cluster + n_panel * n_time,
-        )
+        ) + n_probe
         if self.max_queries < required:
             self.result.notes.append(
                 f"raised Loki query budget {self.max_queries} → {required} "
@@ -916,11 +1046,20 @@ class _Collector:
         self.result.urn_is_label = urn_is_label
         self._raise_query_budget(len(self._panel_exprs))
 
+        # Notification success probe first (request_id mode) so it always has
+        # query budget and success is never missed.
+        if self.request_id:
+            self._notification_probe(ds)
+
         stall_pack = next((p for p in self.packs if p.label == "stall"), self.packs[0])
         for pack in self.packs:
             self._query_priority_logs(pack, ds)
             self._query_panels(pack, ds)
         self._query_stall_stats(stall_pack, ds)
+
+        # Trace id extraction + Tempo cascade (graceful when unavailable).
+        self._extract_trace_id()
+        self._query_tempo()
 
         if self._debug_dropped:
             self.result.notes.append(
@@ -1085,6 +1224,108 @@ class _Collector:
         time_args = self._time_args(pack, ds)
         selector = component_selector(self.preferred_component)
         self.call("query_loki_stats", {**time_args, "logql": selector})
+
+    def _notification_probe(self, ds: str) -> None:
+        """Query the Notification component for the request URN, including DEBUG.
+
+        Runs only in request_id (single-DR) mode. Uses a dedicated LogQL query
+        with no level filter so the DEBUG "successfully processed" marker is
+        never dropped, regardless of the global INCLUDE_DEBUG_LOGS setting.
+        """
+        self.result.notification_checked = True
+        self.result.notification_component = self.notification_component
+        target = (
+            self.urns[0]
+            if self.urns
+            else f"strn:distribution:DeliveryRequest:{self.request_id}"
+        )
+        selector = component_selector(self.notification_component)
+        query = f'{selector} |= "{_escape_label(target)}"'
+        scanned: list[str] = []
+        for pack in self.packs:
+            payload = self.call(
+                "query_loki_logs",
+                {**self._time_args(pack, ds), "logql": query, "limit": self.line_limit},
+            )
+            if payload is None:
+                continue
+            for _, line in _log_entries(payload):
+                persisted, truncated = truncate_line(line, self.line_chars)
+                redacted, n = redact_text(persisted, self._token)
+                self.result.redactions += n
+                if truncated:
+                    self.result.lines_truncated += 1
+                if redacted not in scanned:
+                    scanned.append(redacted)
+        matched_lines, matched_markers = match_success_markers(
+            scanned, self.notification_markers
+        )
+        self.result.notification_success_lines = matched_lines[:NOTIFICATION_SUCCESS_CAP]
+        self.result.notification_markers_matched = matched_markers
+        self.result.notification_success = bool(matched_lines)
+        self._notification_lines = scanned
+        if matched_lines:
+            self.result.notes.append(
+                "Notification success detected ("
+                + ", ".join(matched_markers)
+                + "); STGPT will be skipped"
+            )
+        else:
+            self.result.notes.append(
+                "No Notification success log found for the request; "
+                "analysis proceeds"
+            )
+
+    def _extract_trace_id(self) -> None:
+        sources = (
+            list(self.result.notification_success_lines)
+            + list(getattr(self, "_notification_lines", []))
+            + self._distribution_lines
+            + self._kept_lines
+        )
+        trace_id = extract_trace_id(sources, field=self.trace_id_field)
+        if trace_id:
+            self.result.trace_id = trace_id
+
+    def _find_tempo_tool(self) -> str | None:
+        if self.available is None:
+            return None
+        for name in sorted(self.available):
+            if name in WRITE_TOOLS or name.startswith(WRITE_TOOL_PREFIXES):
+                continue
+            low = name.lower()
+            if any(hint in low for hint in TEMPO_TOOL_HINTS):
+                return name
+        return None
+
+    def _query_tempo(self) -> None:
+        tempo_uid = getattr(self.settings, "tempo_datasource_uid", None)
+        self.result.tempo_datasource_uid = tempo_uid
+        if not tempo_uid:
+            self.result.notes.append("Tempo trace skipped: TEMPO_ID not set")
+            return
+        trace_id = self.result.trace_id
+        if not trace_id:
+            self.result.notes.append(
+                "Tempo trace skipped: no trace id found in logs"
+            )
+            return
+        tool = self._find_tempo_tool()
+        if not tool:
+            self.result.notes.append(
+                "Tempo trace skipped: no read-only Tempo tool available"
+            )
+            return
+        payload = self.call(
+            tool, {"datasourceUid": tempo_uid, "traceId": trace_id}
+        )
+        spans = parse_trace_spans(payload)
+        self.result.trace_spans = spans
+        link = _deeplink_url(payload)
+        if link:
+            self.result.trace_deeplink = link
+        if not spans:
+            self.result.notes.append("Tempo trace: no spans returned")
 
 
 def _public_args(arguments: dict[str, Any]) -> dict[str, Any]:

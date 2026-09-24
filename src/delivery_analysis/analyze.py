@@ -104,6 +104,8 @@ def analyze_staleness(
                     "notes": [f"skipped: verdict {srm.verdict} is not STALE"],
                 }
             )
+        if getattr(grafana, "notification_success", None) is True:
+            return infra_success_record(grafana, base)
         cached = _cache_get(cache_dir, key)
         if cached is not None:
             return cached.model_copy(
@@ -149,6 +151,53 @@ def analyze_staleness(
                 update={"status": "unusable", "notes": [note], "result": fallback}
             )
         )
+
+
+def infra_success_record(
+    grafana: Any | None, base: AnalysisRecord | None = None
+) -> AnalysisRecord:
+    """Build a green 'infra success' record: Notification reported success.
+
+    No bridge call is made; the matched notification lines become citations.
+    """
+    lines = list(getattr(grafana, "notification_success_lines", None) or [])
+    markers = list(getattr(grafana, "notification_markers_matched", None) or [])
+    citations = [
+        AnalysisCitation(quote=line, source="loki_logs") for line in lines[:8]
+    ]
+    marker_text = ", ".join(markers) if markers else "notification success marker"
+    result = AnalysisResult(
+        root_cause=(
+            "Request marked successful from the infra side: the Notification "
+            f"component logged success ({marker_text}). No STGPT analysis needed."
+        ),
+        suggested_fix="No action needed; the request completed successfully.",
+        confidence="high",
+        citations=citations,
+        cannot_determine=False,
+    )
+    template = base or AnalysisRecord(
+        status="infra_success",
+        prompt_version=PROMPT_VERSION,
+        analyzed_at=datetime.now(timezone.utc),
+    )
+    record = template.model_copy(
+        update={
+            "status": "infra_success",
+            "persona": None,
+            "result": result,
+            "fallback_used": False,
+            "cache_hit": False,
+            "response_id": None,
+            "tokens_used": 0,
+            "raw_completion": None,
+            "notes": [
+                "infra success: Notification component reported success; "
+                "STGPT skipped"
+            ],
+        }
+    )
+    return _redact_record(record)
 
 
 def write_analysis(record: AnalysisRecord, out_dir: Path) -> None:

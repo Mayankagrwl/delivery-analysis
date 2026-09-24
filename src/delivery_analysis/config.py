@@ -34,6 +34,21 @@ PERSONAS = ("trinity_for_api", "alfred_for_api")
 PROMPT_VERSION = "srm.s3.2"
 TOKEN_BUDGET_TOTAL = 6000
 STGPT_TIMEOUT_SECONDS = 60.0
+DEFAULT_NOTIFICATION_COMPONENT = "notification"
+DEFAULT_NOTIFICATION_SUCCESS_MARKERS = "successfully processed|mail sent to"
+DEFAULT_TRACE_ID_FIELD = "trace_id"
+
+
+def parse_success_markers(raw: str | None) -> list[str]:
+    """Parse a pipe-separated marker string into a clean, ordered list."""
+    if not raw:
+        raw = DEFAULT_NOTIFICATION_SUCCESS_MARKERS
+    markers: list[str] = []
+    for part in raw.split("|"):
+        marker = part.strip()
+        if marker and marker not in markers:
+            markers.append(marker)
+    return markers or [m.strip() for m in DEFAULT_NOTIFICATION_SUCCESS_MARKERS.split("|")]
 
 
 def srm_url_for_env(env: str, *, host: str | None = None) -> str:
@@ -174,6 +189,14 @@ class Settings:
     stgpt_client_app_name: str = STGPT_CLIENT_APP_NAME
     token_budget: int = TOKEN_BUDGET_TOTAL
     stgpt_timeout: float = STGPT_TIMEOUT_SECONDS
+    notification_component: str = DEFAULT_NOTIFICATION_COMPONENT
+    notification_success_markers: list[str] = field(
+        default_factory=lambda: [
+            m.strip() for m in DEFAULT_NOTIFICATION_SUCCESS_MARKERS.split("|")
+        ]
+    )
+    tempo_datasource_uid: str | None = None
+    trace_id_field: str = DEFAULT_TRACE_ID_FIELD
 
     def __repr__(self) -> str:
         password = "***" if self.srm_basic_password else None
@@ -280,4 +303,12 @@ def load_settings(
         stgpt_client_app_name=resolve_stgpt_client_app_name(),
         token_budget=int(_env("TOKEN_BUDGET", str(TOKEN_BUDGET_TOTAL)) or TOKEN_BUDGET_TOTAL),
         stgpt_timeout=STGPT_TIMEOUT_SECONDS,
+        notification_component=_env("NOTIFICATION_COMPONENT", DEFAULT_NOTIFICATION_COMPONENT)
+        or DEFAULT_NOTIFICATION_COMPONENT,
+        notification_success_markers=parse_success_markers(
+            _env("NOTIFICATION_SUCCESS_MARKERS")
+        ),
+        tempo_datasource_uid=_env("TEMPO_ID"),
+        trace_id_field=_env("TRACE_ID_FIELD", DEFAULT_TRACE_ID_FIELD)
+        or DEFAULT_TRACE_ID_FIELD,
     )

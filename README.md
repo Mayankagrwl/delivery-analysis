@@ -79,6 +79,28 @@ python -m src.delivery_analysis.cli collect --analyze --env prod --request-id 12
 
 Each env writes its own artifacts under `rca-srm/<env>/` (`summary.md`, `srm.json`, `grafana.json`, `analysis.json`). The top-level `rca-srm/summary.md` is an aggregated index: one row per env with its verdict, reason, and a link to that env's `summary.md`. An ALL run isolates failures — one env's error never aborts the others.
 
+## Single-request infra success gate + Tempo trace
+
+When a run is scoped to one DeliveryRequest (`--request-id` / the `request_id` dispatch input), two extra steps run on the `STALE` path:
+
+**Notification success gate.** The pipeline probes the **Notification** component logs in Loki for the request URN and looks for either success marker (case-insensitive): `"successfully processed"` (normally a **DEBUG** line) or `"mail sent to"` (normally **INFO**). The probe uses a dedicated `{component="<notification>"} |= "<urn>"` query with **no level filter**, so it finds DEBUG success lines even when `INCLUDE_DEBUG_LOGS` is off.
+
+- **Found → SUCCESS:** the request is treated as complete from the infra side. **STGPT is not called.** `analysis.json` records `status="infra_success"`, `fallback_used=false`, `tokens_used=0`, and the matched notification lines as citations. `summary.md` shows a **SUCCESS** banner under `## Infra success check (Notification)`.
+- **Not found:** something went wrong — the existing Grafana + STGPT analysis runs as before, and the section says the success log was not found.
+
+This gate only runs in single-request mode; normal all-records staleness runs record "not applicable".
+
+**Tempo trace cascade.** After collecting logs, the run extracts a trace id from the log lines (field variants `trace_id` / `traceId` / `traceID` / `trace-id`, 16- or 32-char hex). If `TEMPO_ID` is set and a read-only Tempo/trace query tool is available over MCP, it queries Tempo for that trace and renders a cascade table (component/service → span → status → duration) under `## Request trace (Tempo)`. If `TEMPO_ID` is unset, no trace id is found, or no Tempo tool is available, it skips with a clear note and never fails the job. Tempo/trace tools are called read-only; write tools are refused.
+
+### More variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TEMPO_ID` | — | Tempo datasource UID for the trace cascade (a variable — never hardcoded). Unset ⇒ trace skipped. |
+| `NOTIFICATION_COMPONENT` | `notification` | Loki `component` value for the notification success probe |
+| `NOTIFICATION_SUCCESS_MARKERS` | `successfully processed\|mail sent to` | Pipe-separated success markers (case-insensitive) |
+| `TRACE_ID_FIELD` | `trace_id` | Preferred trace-id field key when extracting from log lines |
+
 ## Status
 
-S4: dispatch-only GitHub Actions workflow on github.com, now with environment-aware SRM URLs (`environment` dropdown, default `ALL`), an optional `request_id` scope, and per-env `rca-srm/<env>/` artifacts plus an aggregated `rca-srm/summary.md`. SRM, Grafana MCP, and STGPT run from `python -m src.delivery_analysis.cli collect --analyze --env ...`.
+S4: dispatch-only GitHub Actions workflow on github.com, now with environment-aware SRM URLs (`environment` dropdown, default `ALL`), an optional `request_id` scope, and per-env `rca-srm/<env>/` artifacts plus an aggregated `rca-srm/summary.md`. In single-request mode it adds a Notification success gate (skips STGPT on infra success) and a Tempo trace cascade. SRM, Grafana MCP, and STGPT run from `python -m src.delivery_analysis.cli collect --analyze --env ...`.
