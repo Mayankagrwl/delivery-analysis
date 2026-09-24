@@ -4,7 +4,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .models import KeyMap, SrmRecord, SrmResult
-from .srm import as_objects, discover_key_map, get_path, key_inventory
+from .srm import (
+    as_objects,
+    discover_key_map,
+    get_path,
+    key_inventory,
+    normalize_request_id,
+    urn_request_id,
+)
 from .timestamps import UTC, parse_srm_timestamp
 
 
@@ -84,17 +91,33 @@ def evaluate_payload(
     states: tuple[str, ...] = ("SUBMITTED", "GRANTED"),
     url: str | None = None,
     notes: list[str] | None = None,
+    environment: str | None = None,
+    request_id: str | None = None,
 ) -> SrmResult:
     as_of = as_of.astimezone(UTC) if as_of.tzinfo else as_of.replace(tzinfo=UTC)
     cutoff = as_of - timedelta(hours=stale_hours)
     objects = as_objects(payload)
     inventory = key_inventory(objects)
     collected_notes = list(notes or [])
+    scoped_id = normalize_request_id(request_id)
+    if scoped_id is not None:
+        collected_notes.append(
+            "request_id scope: only "
+            f"strn:distribution:DeliveryRequest:{scoped_id}"
+        )
 
-    if not objects:
+    def build(
+        verdict: str,
+        reason: str,
+        *,
+        key_map: KeyMap | None = None,
+        records: list[SrmRecord] | None = None,
+        key_inventory_list: list[str] | None = None,
+        extra_notes: list[str] | None = None,
+    ) -> SrmResult:
         return SrmResult(
-            verdict="NO_RECORDS",
-            reason=_reason("NO_RECORDS", [], stale_hours),
+            verdict=verdict,  # type: ignore[arg-type]
+            reason=reason,
             as_of=as_of,
             cutoff=cutoff,
             timezone="UTC",
@@ -102,80 +125,74 @@ def evaluate_payload(
             stale_mode=stale_mode,
             states=list(states),
             url=url,
-            notes=collected_notes,
+            environment=environment,
+            request_id=scoped_id,
+            key_map=key_map or KeyMap(),
+            records=records or [],
+            key_inventory=key_inventory_list or [],
+            notes=collected_notes + list(extra_notes or []),
         )
+
+    if not objects:
+        return build("NO_RECORDS", _reason("NO_RECORDS", [], stale_hours))
 
     key_map = discover_key_map(objects, states=states)
     if not key_map.state:
-        return SrmResult(
-            verdict="SRM_ERROR",
-            reason="Could not discover SRM state field",
-            as_of=as_of,
-            cutoff=cutoff,
-            timezone="UTC",
-            stale_hours=stale_hours,
-            stale_mode=stale_mode,
-            states=list(states),
-            url=url,
+        return build(
+            "SRM_ERROR",
+            "Could not discover SRM state field",
             key_map=key_map,
-            key_inventory=inventory,
-            notes=collected_notes + ["redacted key inventory in key_inventory"],
+            key_inventory_list=inventory,
+            extra_notes=["redacted key inventory in key_inventory"],
         )
 
     records = extract_records(
         objects, key_map, as_of=as_of, cutoff=cutoff, states=states
     )
+
+    if scoped_id is not None:
+        records = [rec for rec in records if urn_request_id(rec.urn) == scoped_id]
+        if not records:
+            return build(
+                "NO_RECORDS",
+                "Requested DeliveryRequest id "
+                f"{scoped_id} not found in SUBMITTED/GRANTED. Not an incident.",
+                key_map=key_map,
+                key_inventory_list=inventory,
+                extra_notes=[f"requested id {scoped_id} not present in results"],
+            )
+
     if not records:
-        return SrmResult(
-            verdict="NO_RECORDS",
-            reason=_reason("NO_RECORDS", [], stale_hours),
-            as_of=as_of,
-            cutoff=cutoff,
-            timezone="UTC",
-            stale_hours=stale_hours,
-            stale_mode=stale_mode,
-            states=list(states),
-            url=url,
+        return build(
+            "NO_RECORDS",
+            _reason("NO_RECORDS", [], stale_hours),
             key_map=key_map,
-            key_inventory=inventory,
-            notes=collected_notes,
+            key_inventory_list=inventory,
         )
 
     parse_errors = [rec for rec in records if rec.parse_error]
     if parse_errors or not key_map.urn or not key_map.updated_on:
-        detail = parse_errors[0].parse_error if parse_errors else "missing urn or timestamp keys"
-        return SrmResult(
-            verdict="SRM_ERROR",
-            reason=f"SRM parse failure ({detail})",
-            as_of=as_of,
-            cutoff=cutoff,
-            timezone="UTC",
-            stale_hours=stale_hours,
-            stale_mode=stale_mode,
-            states=list(states),
-            url=url,
+        detail = (
+            parse_errors[0].parse_error
+            if parse_errors
+            else "missing urn or timestamp keys"
+        )
+        return build(
+            "SRM_ERROR",
+            f"SRM parse failure ({detail})",
             key_map=key_map,
             records=records,
-            key_inventory=inventory,
-            notes=collected_notes,
+            key_inventory_list=inventory,
         )
 
     stale_any = any(rec.stale for rec in records)
-    verdict: str = "STALE" if stale_any else "FRESH"
-    return SrmResult(
-        verdict=verdict,  # type: ignore[arg-type]
-        reason=_reason(verdict, records, stale_hours),
-        as_of=as_of,
-        cutoff=cutoff,
-        timezone="UTC",
-        stale_hours=stale_hours,
-        stale_mode=stale_mode,
-        states=list(states),
-        url=url,
+    verdict = "STALE" if stale_any else "FRESH"
+    return build(
+        verdict,
+        _reason(verdict, records, stale_hours),
         key_map=key_map,
         records=records,
-        key_inventory=inventory,
-        notes=collected_notes,
+        key_inventory_list=inventory,
     )
 
 
@@ -188,6 +205,8 @@ def error_result(
     states: tuple[str, ...] = ("SUBMITTED", "GRANTED"),
     url: str | None = None,
     notes: list[str] | None = None,
+    environment: str | None = None,
+    request_id: str | None = None,
 ) -> SrmResult:
     as_of = as_of.astimezone(UTC) if as_of.tzinfo else as_of.replace(tzinfo=UTC)
     cutoff = as_of - timedelta(hours=stale_hours)
@@ -201,5 +220,7 @@ def error_result(
         stale_mode=stale_mode,
         states=list(states),
         url=url,
+        environment=environment,
+        request_id=normalize_request_id(request_id),
         notes=list(notes or []),
     )

@@ -337,13 +337,21 @@ class GrafanaCollectTests(unittest.TestCase):
                     )
                     self.assertTrue(grafana["notes"] or grafana["tools"])
                     self.assertNotIn("mcp-secret-token", json.dumps(grafana))
+                    from src.delivery_analysis.collect import MultiEnvResult
+
                     with patch(
-                        "src.delivery_analysis.cli.run_collect",
-                        return_value=result,
+                        "src.delivery_analysis.cli.run_collect_environments",
+                        return_value=MultiEnvResult(
+                            env_selection="prod",
+                            results={"prod": result},
+                            any_error=False,
+                        ),
                     ):
                         rc = main(
                             [
                                 "collect",
+                                "--env",
+                                "prod",
                                 "--as-of",
                                 "2026-09-18T08:00:00Z",
                                 "--out-dir",

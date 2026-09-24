@@ -18,6 +18,14 @@ Empty queue (`NO_RECORDS`) is not an incident: no Grafana, no STGPT.
 - Phase B: move the same tree to **github.st.com**. Enable `30 2 * * *` UTC there.
 - Never hardcode `github.com` or `https://api.github.com` as the only API. Use `GITHUB_SERVER_URL` / `GITHUB_API_URL`. If the host is not github.com, API base is `{server}/api/v3`.
 
+## Multi-environment SRM + workflow inputs
+
+- Five environments: `test`, `int`, `qa`, `demo`, `prod`. SRM URLs are **derived per env** from `SRM_BASE_HOST` (default `https://trd.st.com`) via `config.srm_url_for_env` — never hardcode `trd-srm.st.com` or any single SRM URL. Non-prod envs nest under `/distribution/<env>/`; **`prod` uses the root path with no `/distribution/<env>/` segment**.
+- URL precedence: `--url` (full-URL escape hatch) > `SRM_BASE_URL` env > per-env computed URL.
+- `SRM_ENV` (default `prod`) sets the default env; the workflow `environment` dropdown defaults to **`ALL`** and lists `ALL, test, int, qa, demo, prod`. `ALL` loops every env sequentially (single job), isolating failures, and **includes prod**.
+- Artifacts are per-env under `rca-srm/<env>/`; the top-level `rca-srm/summary.md` is an aggregated index (one row per env, linking to each env's summary). Exit 0 unless `STRICT=true`; under `STRICT` an ALL run exits non-zero if any env errored.
+- Optional `request_id` (workflow string input / `--request-id` / `REQUEST_ID`) scopes the whole pipeline to one DeliveryRequest URN (accepts a bare number or a full URN). Filtering happens in `evaluate_payload` so verdict, Grafana LogQL, and STGPT evidence all scope to that id. A not-found/fresh id is `NO_RECORDS`/`FRESH` (no Grafana/STGPT).
+
 ## Non-negotiables
 
 1. Implement one PRD slice at a time (S0 scaffolding → S1 SRM → S2 Grafana MCP → S3 STGPT → S4 dispatch workflow → S5 GHE cron).

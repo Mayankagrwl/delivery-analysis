@@ -242,8 +242,11 @@ def render_summary_md(
         if result.stale_hours == int(result.stale_hours)
         else result.stale_hours
     )
+    title = "# DeliveryRequest staleness"
+    if result.environment:
+        title += f" — {result.environment}"
     parts = [
-        "# DeliveryRequest staleness",
+        title,
         "",
         "## Verdict",
         "",
@@ -251,10 +254,12 @@ def render_summary_md(
         "",
         "## Window",
         "",
+        f"- Environment: {result.environment or '(default)'}",
         f"- T_now: {_iso(result.as_of)}",
         f"- Timezone: {result.timezone}",
         f"- Stale cutoff: {_iso(result.cutoff)} ({hours}h)",
         f"- STALE_MODE: {result.stale_mode}",
+        f"- request_id scope: {result.request_id or '(all records)'}",
         "",
         "## SRM SUBMITTED",
         "",
@@ -301,5 +306,62 @@ def write_artifacts(
         write_analysis(analysis, out_dir)
     summary_path.write_text(
         render_summary_md(result, grafana=grafana_doc, analysis=analysis),
+        encoding="utf-8",
+    )
+
+
+def _one_line(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def render_index_md(
+    results: dict[str, SrmResult],
+    *,
+    env_selection: str,
+    request_id: str | None = None,
+) -> str:
+    """Aggregated top-level index: one row per env, linking to its summary."""
+    envs = list(results.keys())
+    parts = [
+        "# DeliveryRequest staleness — multi-environment",
+        "",
+        "## Run",
+        "",
+        f"- Environments: {env_selection}"
+        + (f" ({', '.join(envs)})" if len(envs) > 1 else ""),
+        f"- request_id scope: {request_id or '(all records)'}",
+    ]
+    as_of = next((r.as_of for r in results.values()), None)
+    if as_of is not None:
+        parts.append(f"- T_now: {_iso(as_of)} (UTC)")
+    parts.extend(
+        [
+            "",
+            "## Environments",
+            "",
+            "| env | verdict | reason | details |",
+            "|---|---|---|---|",
+        ]
+    )
+    for env in envs:
+        result = results[env]
+        link = f"[{env}/summary.md]({env}/summary.md)"
+        parts.append(
+            f"| {env} | {result.verdict} | {_one_line(result.reason)} | {link} |"
+        )
+    parts.append("")
+    return "\n".join(parts)
+
+
+def write_index(
+    out_dir: Path,
+    results: dict[str, SrmResult],
+    *,
+    env_selection: str,
+    request_id: str | None = None,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "summary.md").write_text(
+        render_index_md(results, env_selection=env_selection, request_id=request_id),
         encoding="utf-8",
     )

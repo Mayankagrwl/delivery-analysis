@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from .analyze import analyze_staleness
-from .collect import run_collect
+from .collect import run_collect_environments
 from .config import load_settings
 from .grafana import GrafanaResult
 from .models import SrmResult
@@ -41,7 +41,24 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument(
         "--url",
         default=None,
-        help="Override SRM_BASE_URL",
+        help="Full SRM URL escape hatch; wins over SRM_BASE_URL and per-env URLs",
+    )
+    collect.add_argument(
+        "--env",
+        default=None,
+        help=(
+            "Environment to collect: one of test/int/qa/demo/prod, or ALL "
+            "(case-insensitive). Default: SRM_ENV env var, else ALL."
+        ),
+    )
+    collect.add_argument(
+        "--request-id",
+        dest="request_id",
+        default=None,
+        help=(
+            "Scope the run to a single DeliveryRequest (bare number or full URN). "
+            "Default: REQUEST_ID env var, else all records."
+        ),
     )
     collect.add_argument(
         "--strict",
@@ -74,17 +91,25 @@ def main(argv: list[str] | None = None) -> int:
         return _run_analyze_command(Path(args.out_dir))
     if args.command != "collect":
         return 2
-    settings = load_settings(url=args.url, strict=args.strict)
-    result = run_collect(
+    settings = load_settings(
+        url=args.url,
+        strict=args.strict,
+        env=args.env,
+        request_id=args.request_id,
+    )
+    multi = run_collect_environments(
+        env=args.env,
         as_of=parse_as_of(args.as_of),
         out_dir=Path(args.out_dir),
         url=args.url,
         settings=settings,
         analyze=args.analyze,
+        request_id=args.request_id,
     )
-    print(f"verdict={result.verdict}")
-    print(f"reason={result.reason}")
-    if result.verdict == "SRM_ERROR" and settings.strict:
+    print(f"environment={multi.env_selection}")
+    for env, result in multi.results.items():
+        print(f"env={env} verdict={result.verdict} reason={result.reason}")
+    if multi.any_error and settings.strict:
         return 1
     return 0
 

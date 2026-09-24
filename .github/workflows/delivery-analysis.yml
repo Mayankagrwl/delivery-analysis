@@ -3,6 +3,22 @@ name: delivery-analysis
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: SRM environment to analyze (ALL runs every env)
+        required: false
+        default: ALL
+        type: choice
+        options:
+          - ALL
+          - test
+          - int
+          - qa
+          - demo
+          - prod
+      request_id:
+        description: Optional DeliveryRequest id to scope the run (e.g. 123456)
+        required: false
+        type: string
       as_of:
         description: Frozen evaluation time UTC (ISO-8601), e.g. 2026-09-18T08:00:00Z
         required: false
@@ -18,6 +34,8 @@ jobs:
     timeout-minutes: 15
     env:
       SRM_BASE_URL: ${{ vars.SRM_BASE_URL }}
+      SRM_BASE_HOST: ${{ vars.SRM_BASE_HOST }}
+      SRM_ENV: ${{ vars.SRM_ENV }}
       SRM_BASIC_USER: ${{ vars.SRM_BASIC_USER }}
       SRM_BASIC_PASSWORD: ${{ secrets.SRM_BASIC_PASSWORD }}
       SRM_STATES: ${{ vars.SRM_STATES }}
@@ -58,12 +76,17 @@ jobs:
       - name: Collect and analyze
         env:
           AS_OF: ${{ inputs.as_of }}
+          ENVIRONMENT: ${{ inputs.environment || 'ALL' }}
+          REQUEST_ID: ${{ inputs.request_id }}
         run: |
+          args=(collect --analyze --env "$ENVIRONMENT")
           if [ -n "$AS_OF" ]; then
-            python -m src.delivery_analysis.cli collect --analyze --as-of "$AS_OF"
-          else
-            python -m src.delivery_analysis.cli collect --analyze
+            args+=(--as-of "$AS_OF")
           fi
+          if [ -n "$REQUEST_ID" ]; then
+            args+=(--request-id "$REQUEST_ID")
+          fi
+          python -m src.delivery_analysis.cli "${args[@]}"
 
       - name: Job Summary
         if: always()

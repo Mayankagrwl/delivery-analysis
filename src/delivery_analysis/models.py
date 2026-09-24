@@ -37,6 +37,8 @@ class SrmResult(BaseModel):
     stale_mode: str = "any"
     states: list[str] = Field(default_factory=lambda: ["SUBMITTED", "GRANTED"])
     url: str | None = None
+    environment: str | None = None
+    request_id: str | None = None
     key_map: KeyMap = Field(default_factory=KeyMap)
     records: list[SrmRecord] = Field(default_factory=list)
     key_inventory: list[str] = Field(default_factory=list)

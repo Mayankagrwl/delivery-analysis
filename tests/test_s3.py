@@ -364,13 +364,21 @@ class CollectAnalyzeTests(unittest.TestCase):
                     )
                     self.assertEqual(analysis["status"], "bridge_error")
                     self.assertTrue((Path(tmp) / "summary.md").exists())
+                    from src.delivery_analysis.collect import MultiEnvResult
+
                     with patch(
-                        "src.delivery_analysis.cli.run_collect",
-                        return_value=result,
+                        "src.delivery_analysis.cli.run_collect_environments",
+                        return_value=MultiEnvResult(
+                            env_selection="prod",
+                            results={"prod": result},
+                            any_error=False,
+                        ),
                     ):
                         rc = main(
                             [
                                 "collect",
+                                "--env",
+                                "prod",
                                 "--as-of",
                                 "2026-09-18T08:00:00Z",
                                 "--out-dir",

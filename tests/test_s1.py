@@ -240,6 +240,8 @@ class CollectCliTests(unittest.TestCase):
                     rc = main(
                         [
                             "collect",
+                            "--env",
+                            "qa",
                             "--as-of",
                             "2026-09-18T08:00:00Z",
                             "--out-dir",
@@ -249,9 +251,10 @@ class CollectCliTests(unittest.TestCase):
                     )
                     self.assertEqual(rc, 0)
                     payload = json.loads(
-                        (Path(tmp) / "srm.json").read_text(encoding="utf-8")
+                        (Path(tmp) / "qa" / "srm.json").read_text(encoding="utf-8")
                     )
                     self.assertEqual(payload["verdict"], "STALE")
+                    self.assertEqual(payload["environment"], "qa")
 
     def test_missing_credentials_is_srm_error_exit_0(self) -> None:
         env = os.environ.copy()
@@ -263,6 +266,8 @@ class CollectCliTests(unittest.TestCase):
                 rc = main(
                     [
                         "collect",
+                        "--env",
+                        "prod",
                         "--as-of",
                         "2026-09-18T08:00:00Z",
                         "--out-dir",
@@ -272,7 +277,7 @@ class CollectCliTests(unittest.TestCase):
                 )
                 self.assertEqual(rc, 0)
                 payload = json.loads(
-                    (Path(tmp) / "srm.json").read_text(encoding="utf-8")
+                    (Path(tmp) / "prod" / "srm.json").read_text(encoding="utf-8")
                 )
                 self.assertEqual(payload["verdict"], "SRM_ERROR")
 

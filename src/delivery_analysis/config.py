@@ -4,9 +4,11 @@ import json
 import os
 from dataclasses import dataclass, field
 
-DEFAULT_SRM_BASE_URL = (
-    "https://trd-srm.st.com/resources/strn:distribution:DeliveryRequest"
-)
+DEFAULT_SRM_HOST = "https://trd.st.com"
+SRM_RESOURCE_PATH = "resources/strn:distribution:DeliveryRequest"
+SRM_ENVIRONMENTS = ("test", "int", "qa", "demo", "prod")
+DEFAULT_SRM_ENV = "prod"
+_PROD_ENV_ALIASES = {"prod", "production", ""}
 DEFAULT_STATES = ("SUBMITTED", "GRANTED")
 DEFAULT_STALE_HOURS = 24.0
 DEFAULT_STALE_MODE = "any"
@@ -32,6 +34,27 @@ PERSONAS = ("trinity_for_api", "alfred_for_api")
 PROMPT_VERSION = "srm.s3.2"
 TOKEN_BUDGET_TOTAL = 6000
 STGPT_TIMEOUT_SECONDS = 60.0
+
+
+def srm_url_for_env(env: str, *, host: str | None = None) -> str:
+    """Build the SRM DeliveryRequest URL for a given environment.
+
+    ``prod`` (also ``production`` / empty) uses the root resource path with no
+    ``/distribution/<env>/`` segment; every other known env is nested under
+    ``/distribution/<env>/``. Raises ``ValueError`` for an unknown env. The host
+    defaults to ``DEFAULT_SRM_HOST`` and is overridable so it is never the only
+    option. Env is normalized to lowercase/trimmed; a trailing ``/`` is stripped
+    from the host.
+    """
+    resolved_host = (host or DEFAULT_SRM_HOST).strip().rstrip("/")
+    normalized = (env or "").strip().lower()
+    if normalized in _PROD_ENV_ALIASES:
+        return f"{resolved_host}/{SRM_RESOURCE_PATH}"
+    if normalized in SRM_ENVIRONMENTS:
+        return f"{resolved_host}/distribution/{normalized}/{SRM_RESOURCE_PATH}"
+    raise ValueError(
+        f"unknown SRM env {env!r}; allowed: {', '.join(SRM_ENVIRONMENTS)}"
+    )
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -121,6 +144,10 @@ def tls_verify() -> bool | str:
 @dataclass
 class Settings:
     srm_base_url: str
+    srm_env: str
+    srm_base_host: str
+    srm_base_url_override: str | None
+    request_id: str | None
     srm_basic_user: str | None
     srm_basic_password: str | None
     srm_states: tuple[str, ...]
@@ -154,6 +181,9 @@ class Settings:
         return (
             "Settings("
             f"srm_base_url={self.srm_base_url!r}, "
+            f"srm_env={self.srm_env!r}, "
+            f"srm_base_host={self.srm_base_host!r}, "
+            f"request_id={self.request_id!r}, "
             f"srm_basic_user={self.srm_basic_user!r}, "
             f"srm_basic_password={password}, "
             f"srm_states={self.srm_states!r}, "
@@ -177,6 +207,8 @@ def load_settings(
     *,
     url: str | None = None,
     strict: bool | None = None,
+    env: str | None = None,
+    request_id: str | None = None,
 ) -> Settings:
     states_raw = _env("SRM_STATES", ",".join(DEFAULT_STATES)) or ",".join(DEFAULT_STATES)
     states = tuple(part.strip() for part in states_raw.split(",") if part.strip())
@@ -192,8 +224,28 @@ def load_settings(
     transport = (
         _env("GRAFANA_MCP_TRANSPORT", DEFAULT_MCP_TRANSPORT) or DEFAULT_MCP_TRANSPORT
     ).lower()
+    srm_base_host = (_env("SRM_BASE_HOST", DEFAULT_SRM_HOST) or DEFAULT_SRM_HOST).rstrip("/")
+    srm_env = (env or _env("SRM_ENV", DEFAULT_SRM_ENV) or DEFAULT_SRM_ENV).strip().lower()
+    # Full-URL escape hatch: explicit --url beats SRM_BASE_URL env.
+    override = (url.strip() if url and url.strip() else None) or _env("SRM_BASE_URL")
+    # Precedence: explicit --url > SRM_BASE_URL env > per-env computed URL.
+    if override:
+        resolved_srm_url = override
+    elif srm_env in SRM_ENVIRONMENTS or srm_env in _PROD_ENV_ALIASES:
+        resolved_srm_url = srm_url_for_env(srm_env, host=srm_base_host)
+    else:
+        # e.g. srm_env == "all": no single URL applies; keep a harmless prod
+        # default. The multi-env orchestrator computes each env's URL itself.
+        resolved_srm_url = srm_url_for_env(DEFAULT_SRM_ENV, host=srm_base_host)
+    resolved_request_id = request_id if request_id is not None else _env("REQUEST_ID")
+    if resolved_request_id is not None:
+        resolved_request_id = resolved_request_id.strip() or None
     return Settings(
-        srm_base_url=url or _env("SRM_BASE_URL", DEFAULT_SRM_BASE_URL) or DEFAULT_SRM_BASE_URL,
+        srm_base_url=resolved_srm_url,
+        srm_env=srm_env,
+        srm_base_host=srm_base_host,
+        srm_base_url_override=override,
+        request_id=resolved_request_id,
         srm_basic_user=_env("SRM_BASIC_USER"),
         srm_basic_password=_env("SRM_BASIC_PASSWORD"),
         srm_states=states or DEFAULT_STATES,

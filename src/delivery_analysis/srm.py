@@ -11,6 +11,7 @@ from .config import Settings
 from .models import KeyMap
 
 URN_PATTERN = re.compile(r"strn:distribution:DeliveryRequest:\d+")
+_TRAILING_ID = re.compile(r"(\d+)\s*$")
 DATEISH_PATTERN = re.compile(
     r"(?:\d{1,2}/\d{1,2}/\d{4}(?:\s+\d{1,2}:\d{2}:\d{2}\s*(?:AM|PM)?)?)"
     r"|(?:\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?)",
@@ -23,6 +24,30 @@ STATE_CANDIDATES = ("state",)
 
 class SrmError(Exception):
     pass
+
+
+def normalize_request_id(raw: str | None) -> str | None:
+    """Extract the numeric DeliveryRequest id from a bare number or full URN.
+
+    Accepts ``123456`` or ``strn:distribution:DeliveryRequest:123456`` (and any
+    string ending in the numeric id). Returns the id as a string, or ``None`` if
+    no trailing number is present.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    match = _TRAILING_ID.search(text)
+    return match.group(1) if match else None
+
+
+def urn_request_id(urn: str | None) -> str | None:
+    """Return the trailing numeric id of a URN string, robust to prefixes."""
+    if not urn:
+        return None
+    match = _TRAILING_ID.search(str(urn))
+    return match.group(1) if match else None
 
 
 def safe_url(url: str) -> str:
