@@ -263,7 +263,9 @@ def _ai_raw_section(analysis: Any) -> list[str]:
     return parts
 
 
-def _notification_section(result: SrmResult, grafana: Any | None) -> list[str]:
+def _notification_section(
+    result: SrmResult, grafana: Any | None, analysis: Any | None = None
+) -> list[str]:
     parts = ["## Infra success check (Notification)", ""]
     if not result.request_id:
         parts.append(
@@ -310,11 +312,23 @@ def _notification_section(result: SrmResult, grafana: Any | None) -> list[str]:
                 f"{window}; genuine stale incident, STGPT analysis proceeded."
             )
         else:
-            parts.append(
-                f"No completion evidence found for id {result.request_id}"
-                f"{window} — **investigate**. Request is not stale; no AI "
-                "analysis was performed."
-            )
+            ai_ran = analysis is not None and getattr(analysis, "status", None) not in {
+                None,
+                "investigate",
+                "gated",
+            }
+            if ai_ran:
+                parts.append(
+                    f"No completion evidence found for id {result.request_id}"
+                    f"{window} — **investigate**. Request is not stale; AI "
+                    "analysis was forced (see AI analysis below)."
+                )
+            else:
+                parts.append(
+                    f"No completion evidence found for id {result.request_id}"
+                    f"{window} — **investigate**. Request is not stale; no AI "
+                    "analysis was performed."
+                )
         parts.append("")
         parts.append(f"- Notification component: `{component}`")
         parts.append(f"- Notification lines scanned: {scanned}")
@@ -416,7 +430,7 @@ def render_summary_md(
     ]
     parts.extend(_grafana_inventory(grafana, result.verdict))
     parts.extend(_evidence_highlights(grafana))
-    parts.extend(_notification_section(result, grafana))
+    parts.extend(_notification_section(result, grafana, analysis))
     parts.extend(_trace_section(grafana))
     parts.extend(_ai_section(analysis, result.verdict))
     if result.notes:

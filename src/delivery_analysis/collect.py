@@ -219,10 +219,15 @@ def run_collect(
         print(f"analysis_status={analysis.status}")
 
     if scoped_request_id:
+        forced_fresh = (
+            bool(getattr(cfg, "force_ai", False)) and result.verdict == "FRESH"
+        )
         if getattr(grafana, "notification_success", None) is True:
             result.request_outcome = "SUCCESS"
         elif result.verdict == "STALE":
             result.request_outcome = "STALE (AI analysis)"
+        elif forced_fresh:
+            result.request_outcome = "FRESH (forced AI analysis)"
         else:
             result.request_outcome = "INVESTIGATE (no completion evidence)"
 
@@ -275,26 +280,44 @@ def _maybe_analyze(
     # STALE (success beats AI analysis).
     if getattr(grafana, "notification_success", None) is True:
         return infra_success_record(grafana)
-    if result.verdict == "STALE":
-        try:
-            return analyze_staleness(
-                result,
-                grafana,
-                url=cfg.stgpt_api_url,
-                client_app_name=cfg.stgpt_client_app_name,
-                chat_fn=chat_fn,
-                cache_dir=cache_dir,
-                token_budget=cfg.token_budget,
-            )
-        except Exception as exc:
-            return AnalysisRecord(
-                status="unusable",
-                notes=[exc.__class__.__name__],
-            )
-    if _request_scoped(result, cfg):
+    request_scoped = _request_scoped(result, cfg)
+    # force_ai: when the operator ticks "force AI" for a request_id run, analyze a
+    # record that is present in SUBMITTED/GRANTED but not yet stale (verdict FRESH).
+    force_fresh = (
+        bool(getattr(cfg, "force_ai", False))
+        and request_scoped
+        and result.verdict == "FRESH"
+    )
+    if result.verdict == "STALE" or force_fresh:
+        return _run_analysis(result, grafana, cfg, chat_fn, cache_dir, force=force_fresh)
+    if request_scoped:
         # Not stale and no completion evidence: investigate, never call STGPT.
         return investigate_record(
             result.request_id or cfg.request_id,
             getattr(cfg, "request_id_lookback_hours", None),
         )
     return skipped_analysis(reason="skipped (verdict not STALE)")
+
+
+def _run_analysis(
+    result: SrmResult,
+    grafana: GrafanaResult,
+    cfg: Settings,
+    chat_fn: ChatFn | None,
+    cache_dir: Path | str | None,
+    *,
+    force: bool = False,
+) -> AnalysisRecord:
+    try:
+        return analyze_staleness(
+            result,
+            grafana,
+            url=cfg.stgpt_api_url,
+            client_app_name=cfg.stgpt_client_app_name,
+            chat_fn=chat_fn,
+            cache_dir=cache_dir,
+            token_budget=cfg.token_budget,
+            force=force,
+        )
+    except Exception as exc:
+        return AnalysisRecord(status="unusable", notes=[exc.__class__.__name__])

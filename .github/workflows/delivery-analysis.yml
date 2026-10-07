@@ -19,6 +19,11 @@ on:
         description: Optional DeliveryRequest id to scope the run (e.g. 123456)
         required: false
         type: string
+      force_ai:
+        description: Force AI analysis even if the request_id is not stale (present in SUBMITTED/GRANTED)
+        required: false
+        default: false
+        type: boolean
       as_of:
         description: Frozen evaluation time UTC (ISO-8601), e.g. 2026-09-18T08:00:00Z
         required: false
@@ -85,6 +90,7 @@ jobs:
           AS_OF: ${{ inputs.as_of }}
           ENVIRONMENT: ${{ inputs.environment || 'ALL' }}
           REQUEST_ID: ${{ inputs.request_id }}
+          FORCE_AI: ${{ inputs.force_ai }}
         run: |
           args=(collect --analyze --env "$ENVIRONMENT")
           if [ -n "$AS_OF" ]; then
@@ -92,6 +98,9 @@ jobs:
           fi
           if [ -n "$REQUEST_ID" ]; then
             args+=(--request-id "$REQUEST_ID")
+          fi
+          if [ "$FORCE_AI" = "true" ]; then
+            args+=(--force-ai)
           fi
           python -m src.delivery_analysis.cli "${args[@]}"
 

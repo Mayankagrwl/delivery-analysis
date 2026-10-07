@@ -84,6 +84,7 @@ def analyze_staleness(
     chat_fn: ChatFn | None = None,
     cache_dir: Path | str | None = None,
     token_budget: int | None = None,
+    force: bool = False,
 ) -> AnalysisRecord:
     now = datetime.now(timezone.utc)
     cap = TOKEN_BUDGET_TOTAL if token_budget is None else token_budget
@@ -97,7 +98,9 @@ def analyze_staleness(
         token_budget=cap,
     )
     try:
-        if srm.verdict != "STALE":
+        # ``force`` lets a request_id run analyze a not-stale (FRESH) record
+        # on operator request; otherwise only STALE proceeds.
+        if srm.verdict != "STALE" and not force:
             return base.model_copy(
                 update={
                     "status": "gated",

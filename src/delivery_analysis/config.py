@@ -220,6 +220,7 @@ class Settings:
     tempo_datasource_uid: str | None = None
     trace_id_field: str = DEFAULT_TRACE_ID_FIELD
     request_id_lookback_hours: float = DEFAULT_REQUEST_ID_LOOKBACK_HOURS
+    force_ai: bool = False
 
     def __repr__(self) -> str:
         password = "***" if self.srm_basic_password else None
@@ -255,6 +256,7 @@ def load_settings(
     strict: bool | None = None,
     env: str | None = None,
     request_id: str | None = None,
+    force_ai: bool | None = None,
 ) -> Settings:
     states_raw = _env("SRM_STATES", ",".join(DEFAULT_STATES)) or ",".join(DEFAULT_STATES)
     states = tuple(part.strip() for part in states_raw.split(",") if part.strip())
@@ -345,4 +347,5 @@ def load_settings(
             _env("REQUEST_ID_LOOKBACK_HOURS", str(DEFAULT_REQUEST_ID_LOOKBACK_HOURS))
             or DEFAULT_REQUEST_ID_LOOKBACK_HOURS
         ),
+        force_ai=_as_bool(_env("FORCE_AI"), False) if force_ai is None else force_ai,
     )

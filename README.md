@@ -98,6 +98,8 @@ The outcome, shown in `## Infra success check (Notification)` and as an **Outcom
 
 So AI runs only when the request is actually `STALE`; a non-stale request resolves to SUCCESS or INVESTIGATE with no tokens spent. Normal all-records staleness runs (no `request_id`) are unchanged — Grafana + STGPT still run only on `STALE` — and the gate records "not applicable".
 
+**Force AI (opt-in).** The workflow has a **`force_ai`** checkbox (CLI `--force-ai`, env `FORCE_AI`). When ticked, a `request_id` whose record is **present in `SUBMITTED`/`GRANTED` but not yet stale** (verdict `FRESH`) gets the full STGPT analysis instead of the no-AI **INVESTIGATE** outcome — useful for an early RCA before the 24h SLA elapses. The outcome shows as **FRESH (forced AI analysis)**. Scope guards: it only applies in `request_id` mode, only to `FRESH` (present) records — **not** to `NO_RECORDS` (absent id), and a notification **SUCCESS** still wins (a completed request needs no AI). All-records runs ignore it.
+
 **Tempo trace cascade.** After collecting logs, the run extracts a trace id from the log lines (field variants `trace_id` / `traceId` / `traceID` / `trace-id`, 16- or 32-char hex). If `TEMPO_ID` is set and a read-only Tempo/trace query tool is available over MCP, it queries Tempo for that trace and renders a cascade table (component/service → span → status → duration) under `## Request trace (Tempo)`. If `TEMPO_ID` is unset, no trace id is found, or no Tempo tool is available, it skips with a clear note and never fails the job. Tempo/trace tools are called read-only; write tools are refused.
 
 ### More variables

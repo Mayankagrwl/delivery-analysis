@@ -61,6 +61,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     collect.add_argument(
+        "--force-ai",
+        dest="force_ai",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Force STGPT analysis for a request_id that is present in "
+            "SUBMITTED/GRANTED but not yet stale (verdict FRESH). "
+            "Default: FORCE_AI env var, else false."
+        ),
+    )
+    collect.add_argument(
         "--strict",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -96,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         strict=args.strict,
         env=args.env,
         request_id=args.request_id,
+        force_ai=args.force_ai,
     )
     multi = run_collect_environments(
         env=args.env,
