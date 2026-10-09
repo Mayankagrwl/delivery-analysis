@@ -351,7 +351,7 @@ class ReportSectionTests(unittest.TestCase):
         summary = render_summary_md(srm)
         self.assertIn("## Infra success check (Notification)", summary)
         self.assertIn("not applicable", summary)
-        self.assertIn("## Request trace (Tempo)", summary)
+        self.assertIn("## Request trace (Tempo", summary)
 
 
 if __name__ == "__main__":

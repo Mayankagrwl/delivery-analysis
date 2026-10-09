@@ -340,7 +340,7 @@ def load_settings(
         grafana_env_label_values=parse_env_label_values(
             _env("GRAFANA_ENV_LABEL_VALUES")
         ),
-        tempo_datasource_uid=_env("TEMPO_ID"),
+        tempo_datasource_uid=_env("TEMPO_ID") or _env("TEMPO_DATASOURCE_ID"),
         trace_id_field=_env("TRACE_ID_FIELD", DEFAULT_TRACE_ID_FIELD)
         or DEFAULT_TRACE_ID_FIELD,
         request_id_lookback_hours=float(

@@ -45,19 +45,43 @@ EVENTSENDER_PAIR_RE = re.compile(r"\b(Started|Sent)\b")
 STALL_PAD_BEFORE = timedelta(hours=2)
 STALL_PAD_AFTER = timedelta(hours=6)
 MAX_COMBINED_STALL = timedelta(days=7)
-LEVEL_WARN_FILTER = "LEVEL=(alert|error|warn|ALERT|ERROR|WARN)"
+# Top severity tier includes CRIT/CRITICAL/FATAL/EMERG — these were previously
+# dropped by the filter, so critical component lines never reached the report.
+LEVEL_WARN_FILTER = (
+    "LEVEL=(?i)(emerg|emergency|alert|crit|critical|fatal|error|err|warn|warning)"
+)
 LEVEL_INFO_FILTER = "LEVEL=(INFO|info)"
 LEVEL_DEBUG_FILTER = "LEVEL=(debug|DEBUG)"
 SEVERITY_PATTERN = LEVEL_WARN_FILTER
 DEBUG_LEVELS = {"debug"}
-KEEP_LEVELS = {"alert", "error", "warn", "warning", "fatal", "critical"}
+KEEP_LEVELS = {
+    "emerg",
+    "emergency",
+    "alert",
+    "crit",
+    "critical",
+    "fatal",
+    "error",
+    "err",
+    "warn",
+    "warning",
+}
+CRITICAL_LEVELS = {"emerg", "emergency", "alert", "crit", "critical", "fatal"}
 LEVEL_RE = re.compile(
-    r'(?:LEVEL|level)[=:][\s"]*(alert|error|warn(?:ing)?|debug|info|fatal|critical)\b'
-    r'|\[(alert|error|warn(?:ing)?|debug|info)\]',
+    r"(?:LEVEL|level)[=:][\s\"]*"
+    r"(emerg(?:ency)?|alert|crit(?:ical)?|fatal|error|err|warn(?:ing)?|debug|info)\b"
+    r"|\[(emerg(?:ency)?|alert|crit(?:ical)?|fatal|error|err|warn(?:ing)?|debug|info)\]",
     re.IGNORECASE,
 )
+# A line is critical if its level token is CRIT/CRITICAL/FATAL/EMERG/ALERT.
+CRIT_RE = re.compile(r"(?i)\b(critical|crit|fatal|emergency|emerg|alert)\b")
 COMPONENT_RE = re.compile(
     r'(?i)(?:component)["\']?\s*[:=]\s*["\']?([A-Za-z0-9_.:-]+)'
+)
+# Log lines carry the emitting component as a SERVICE= field (per the Service
+# Logs dashboard regex); fall back to a component= field if present.
+SERVICE_RE = re.compile(
+    r'(?i)\bSERVICE["\']?\s*[:=]\s*["\']?([A-Za-z0-9_.:-]+)'
 )
 SELECTOR_RE = re.compile(r"\{([^}]*)\}")
 PANEL_EXPR_KEYS = {"expr", "logql", "query", "exprraw", "rawsql"}
@@ -118,6 +142,13 @@ class GrafanaResult(BaseModel):
     notification_lookback_hours: float | None = None
     notification_request_id: str | None = None
     notification_lines_scanned: int = 0
+    # Cross-component trace by the propagated correlation ID (not TRACE_ID)
+    correlation_id: str | None = None
+    id_trace_scanned: int = 0
+    id_trace_components: list[str] = Field(default_factory=list)
+    id_trace_lines: list[str] = Field(default_factory=list)
+    crit_lines: list[str] = Field(default_factory=list)
+    crit_count: int = 0
     # Tempo trace cascade
     tempo_datasource_uid: str | None = None
     trace_id: str | None = None
@@ -385,7 +416,18 @@ def classify_level(line: str) -> str | None:
     value = (match.group(1) or match.group(2) or "").lower()
     if value == "warning":
         return "warn"
+    if value == "err":
+        return "error"
+    if value == "crit":
+        return "critical"
+    if value == "emergency":
+        return "emerg"
     return value or None
+
+
+def is_critical_line(line: str) -> bool:
+    """True when the line's level token is CRIT/CRITICAL/FATAL/EMERG/ALERT."""
+    return bool(CRIT_RE.search(line))
 
 
 def classify_component(line: str) -> str | None:
@@ -393,6 +435,14 @@ def classify_component(line: str) -> str | None:
     if not match:
         return None
     return match.group(1)
+
+
+def classify_service(line: str) -> str | None:
+    """Emitting component/service from a SERVICE= field, else component=."""
+    match = SERVICE_RE.search(line)
+    if match:
+        return match.group(1)
+    return classify_component(line)
 
 
 def _panel_logql(payload: Any) -> list[str]:
@@ -718,12 +768,15 @@ _HEX_16_OR_32 = r"([0-9a-fA-F]{32}|[0-9a-fA-F]{16})(?![0-9a-fA-F])"
 
 
 def _request_id_re(field: str | None = None) -> re.Pattern[str]:
-    """Match a correlation request id: the configured field key or variants.
+    """Match the correlation id propagated across components.
 
-    The notification success markers ("successfully processed", "mail sent to")
-    are keyed by this id, not by the DeliveryRequest URN. Handles JSON
-    (``"requestId":"aq0..."``) and ``key=value`` forms; the value is 8+ chars of
-    ``[A-Za-z0-9_-]`` so it never matches a bare numeric id.
+    This id (shown as ``ID`` in the Service Logs dashboard and also seen as
+    ``"requestId"``) — NOT the volatile ``TRACE_ID`` — ties a request's lines
+    together across every component. Handles JSON (``"requestId":"aq0..."``),
+    ``key=value`` / ``key:value`` forms, and the logfmt ``ID=<value>`` field. A
+    standalone ``ID`` key is guarded by a lookbehind so ``TRACE_ID`` /
+    ``CLIENT_ID`` never match it. The value is 8+ chars of ``[A-Za-z0-9_-]`` so
+    it never matches a bare numeric DeliveryRequest id.
     """
     keys = ["request[_-]?id"]
     if field:
@@ -732,7 +785,8 @@ def _request_id_re(field: str | None = None) -> re.Pattern[str]:
             keys.insert(0, esc)
     key_alt = "|".join(keys)
     return re.compile(
-        rf'(?i)(?:{key_alt})["\']?\s*[:=]\s*["\']?([A-Za-z0-9][A-Za-z0-9_\-]{{7,}})'
+        rf'(?i)(?:(?<![A-Za-z_])ID|{key_alt})'
+        rf'["\']?\s*[:=]\s*["\']?([A-Za-z0-9][A-Za-z0-9_\-]{{7,}})'
     )
 
 
@@ -1044,10 +1098,12 @@ class _Collector:
         n_passes = 3 if self.include_debug else 2
         n_cluster = 1
         # In request_id mode reserve budget for the two-hop notification probe
-        # (URN query + one query per resolved requestId, each across time packs)
-        # plus a Tempo trace call.
+        # (URN query + one query per resolved requestId), the ID cross-component
+        # trace (+ a fallback URN resolve), each across time packs, plus Tempo.
         n_probe = (
-            n_time * (1 + MAX_NOTIFICATION_REQUEST_IDS) + 2 if self.request_id else 0
+            n_time * (1 + MAX_NOTIFICATION_REQUEST_IDS + 2) + 2
+            if self.request_id
+            else 0
         )
         required = max(
             LOGQL_TEMPLATES_PER_PACK * n_time * n_passes,
@@ -1192,7 +1248,14 @@ class _Collector:
             self._query_panels(pack, ds)
         self._query_stall_stats(stall_pack, ds)
 
-        # Trace id extraction + Tempo cascade (graceful when unavailable).
+        # Cross-component trace by the propagated correlation ID (request_id
+        # mode). This follows the request across every component via the stable
+        # ID (not the volatile TRACE_ID) and surfaces CRIT lines that a single
+        # per-component / trace-id search would miss.
+        if self.request_id:
+            self._id_cross_component_trace(ds)
+
+        # Trace id extraction + optional Tempo cascade (secondary; graceful).
         self._extract_trace_id()
         self._query_tempo()
 
@@ -1460,6 +1523,89 @@ class _Collector:
                 f"lines_scanned={self.result.notification_lines_scanned}, "
                 f"{rid_note}, window=last {int(self.lookback_hours)}h)"
             )
+        # The notification requestId is the propagated correlation ID; reuse it
+        # for the cross-component trace below.
+        if self.result.notification_request_id and not self.result.correlation_id:
+            self.result.correlation_id = self.result.notification_request_id
+
+    def _env_selector(self) -> str:
+        """Selector across all components, scoped to the env when known."""
+        if self.environment_value:
+            return "{" + _label_pair("environment", self.environment_value) + "}"
+        return '{component=~".+"}'
+
+    def _resolve_correlation_id(self, ds: str) -> str | None:
+        """Resolve the propagated correlation ID for the request.
+
+        Prefer the id already found by the notification probe; otherwise look in
+        the lines collected so far, then fall back to one all-component URN query.
+        """
+        if self.result.correlation_id:
+            return self.result.correlation_id
+        pooled = (
+            list(getattr(self, "_notification_lines", []))
+            + self._distribution_lines
+            + self._other_lines
+            + self._kept_lines
+        )
+        ids = extract_request_ids(pooled, field=self.notification_request_id_field)
+        if not ids:
+            target = (
+                self.urns[0]
+                if self.urns
+                else f"strn:distribution:DeliveryRequest:{self.request_id}"
+            )
+            lines = self._scan_notification(
+                f'{self._env_selector()} |= "{_escape_label(target)}"', ds
+            )
+            ids = extract_request_ids(
+                lines, field=self.notification_request_id_field
+            )
+        self.result.correlation_id = ids[0] if ids else None
+        return self.result.correlation_id
+
+    def _id_cross_component_trace(self, ds: str) -> None:
+        """Follow the request across every component via the correlation ID.
+
+        Queries Loki for the ID across all components with no level filter, so
+        CRIT/critical lines emitted by any component are captured (they were
+        previously missed: the volatile TRACE_ID did not correlate them and the
+        severity filter dropped CRIT). Builds an ordered component cascade and a
+        CRIT highlight list, and feeds both into the evidence pack.
+        """
+        cid = self._resolve_correlation_id(ds)
+        if not cid:
+            self.result.notes.append(
+                "ID trace skipped: no correlation ID resolved from the request's "
+                "URN lines"
+            )
+            return
+        lines = self._scan_notification(
+            f'{self._env_selector()} |= "{_escape_label(cid)}"', ds
+        )
+        self.result.id_trace_scanned = len(lines)
+        components: list[str] = []
+        crit: list[str] = []
+        for line in lines:
+            service = classify_service(line) or "unknown"
+            if service not in components:
+                components.append(service)
+            if is_critical_line(line):
+                crit.append(line)
+            # Feed cross-component lines into the evidence pack.
+            if line not in self._other_lines and line not in self._distribution_lines:
+                self._other_lines.append(line)
+        self.result.id_trace_lines = lines[:NOTIFICATION_SUCCESS_CAP]
+        self.result.id_trace_components = components
+        self.result.crit_lines = crit[:NOTIFICATION_SUCCESS_CAP]
+        self.result.crit_count = len(crit)
+        note = (
+            f"ID trace: {len(lines)} line(s) for ID {cid} across "
+            f"{len(components)} component(s)"
+        )
+        if crit:
+            note += f"; {len(crit)} CRIT/critical line(s) found"
+        self.result.notes.append(note)
 
     def _extract_trace_id(self) -> None:
         sources = (

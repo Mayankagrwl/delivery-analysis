@@ -340,8 +340,50 @@ def _notification_section(
     return parts
 
 
+def _id_trace_section(result: SrmResult, grafana: Any | None) -> list[str]:
+    parts = ["## Request trace (by ID)", ""]
+    if not result.request_id:
+        parts.append("not applicable (no request_id)")
+        parts.append("")
+        return parts
+    if grafana is None or not getattr(grafana, "notification_checked", False):
+        parts.append("not run (Grafana collection skipped)")
+        parts.append("")
+        return parts
+    cid = getattr(grafana, "correlation_id", None)
+    if not cid:
+        parts.append(
+            "No correlation ID resolved from the request's URN lines — "
+            "cross-component trace unavailable."
+        )
+        parts.append("")
+        return parts
+    components = list(getattr(grafana, "id_trace_components", None) or [])
+    scanned = getattr(grafana, "id_trace_scanned", 0)
+    crit_count = getattr(grafana, "crit_count", 0)
+    parts.append(f"- Correlation ID: `{cid}` (propagated across components)")
+    parts.append(f"- Lines scanned: {scanned}")
+    parts.append(
+        "- Components touched: "
+        + (", ".join(f"`{c}`" for c in components) or "(none)")
+    )
+    crit_lines = list(getattr(grafana, "crit_lines", None) or [])
+    if crit_lines:
+        parts.append(f"- **CRIT/critical lines: {crit_count}**")
+        parts.append("")
+        parts.append("### CRIT highlights")
+        parts.append("")
+        parts.append("```")
+        parts.extend(crit_lines)
+        parts.append("```")
+    else:
+        parts.append(f"- CRIT/critical lines: {crit_count}")
+    parts.append("")
+    return parts
+
+
 def _trace_section(grafana: Any | None) -> list[str]:
-    parts = ["## Request trace (Tempo)", ""]
+    parts = ["## Request trace (Tempo, optional)", ""]
     if grafana is None:
         parts.append("skipped (Grafana collection not run)")
         parts.append("")
@@ -431,6 +473,7 @@ def render_summary_md(
     parts.extend(_grafana_inventory(grafana, result.verdict))
     parts.extend(_evidence_highlights(grafana))
     parts.extend(_notification_section(result, grafana, analysis))
+    parts.extend(_id_trace_section(result, grafana))
     parts.extend(_trace_section(grafana))
     parts.extend(_ai_section(analysis, result.verdict))
     if result.notes:

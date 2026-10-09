@@ -89,7 +89,7 @@ class NoRecordsSuccessTests(unittest.TestCase):
         self.assertIn("SUCCESS", summary)
         self.assertIn("successfully processed", summary)
         # Tempo cascade rendered.
-        self.assertIn("## Request trace (Tempo)", summary)
+        self.assertIn("## Request trace (Tempo", summary)
         self.assertIn("send-mail", summary)
 
 

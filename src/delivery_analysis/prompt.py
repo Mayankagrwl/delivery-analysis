@@ -138,6 +138,24 @@ def _evidence_lines(srm: SrmResult, grafana: Any | None) -> list[str]:
     for line in other:
         lines.append(line)
 
+    crit_lines = list(getattr(grafana, "crit_lines", None) or [])
+    if crit_lines:
+        lines.append("### crit_lines")
+        lines.append(
+            "CRIT/critical lines found for the request across components "
+            "(highest priority):"
+        )
+        for line in crit_lines:
+            lines.append(line)
+    cid = getattr(grafana, "correlation_id", None)
+    id_components = list(getattr(grafana, "id_trace_components", None) or [])
+    if cid or id_components:
+        lines.append("### id_trace")
+        if cid:
+            lines.append(f"correlation_id={cid}")
+        if id_components:
+            lines.append("components=" + ",".join(id_components))
+
     lines.append("### grafana_dashboard")
     lines.append(
         f"title={grafana.dashboard_title} uid={grafana.dashboard_uid} "

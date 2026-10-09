@@ -170,7 +170,9 @@ class LogqlTests(unittest.TestCase):
             ["strn:distribution:DeliveryRequest:43"], include_per_urn=False
         )
         self.assertTrue(queries[0].startswith('{component="distribution"}'))
-        self.assertIn("LEVEL=(alert|error|warn|ALERT|ERROR|WARN)", queries[0])
+        self.assertIn("LEVEL=", queries[0])
+        self.assertIn("crit", queries[0])
+        self.assertIn("warn", queries[0])
         self.assertNotIn("{env=", queries[0])
         self.assertNotIn("{level=", queries[0])
 
@@ -695,7 +697,9 @@ class GrafanaCollectTests(unittest.TestCase):
         ]
         queries = build_priority_logql(urns)
         self.assertTrue(queries[0].startswith('{component="distribution"}'))
-        self.assertIn("LEVEL=(alert|error|warn|ALERT|ERROR|WARN)", queries[0])
+        self.assertIn("LEVEL=", queries[0])
+        self.assertIn("crit", queries[0])
+        self.assertIn("warn", queries[0])
         self.assertIn('component=~".+"', queries[-1])
         dist_i = next(i for i, q in enumerate(queries) if 'component="distribution"' in q)
         all_i = next(i for i, q in enumerate(queries) if 'component=~".+"' in q)
@@ -749,7 +753,8 @@ class GrafanaCollectTests(unittest.TestCase):
         grafana = collect_grafana(srm, settings, client=fake)
         logql = [args["logql"] for name, args in fake.calls if name == "query_loki_logs"]
         joined = "\n".join(logql)
-        self.assertIn("LEVEL=(alert|error|warn|ALERT|ERROR|WARN)", joined)
+        self.assertIn("crit", joined)
+        self.assertIn("LEVEL=", joined)
         self.assertIn("LEVEL=(INFO|info)", joined)
         self.assertTrue(any("LEVEL=INFO" in line for line in grafana.highlights))
         self.assertIn("info", grafana.level_pass.values())
